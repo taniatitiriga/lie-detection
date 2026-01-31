@@ -1,22 +1,25 @@
 
 ## Setup
 
+### Clone this repository
+```
+git clone https://github.com/taniatitiriga/lie-detection
+cd lie-detection
+```
+
 ### Package manager
 Install `uv` package manager here: https://docs.astral.sh/uv/getting-started/installation/
 
-Setup virtual env and install dependencies for experimenting:
+Install dependencies for experimenting:
 ```
-uv venv --python 3.12
-source .venv/bin/activate
-uv pip install -U pip setuptools wheel
-uv pip install numpy pandas scikit-learn joblib
+uv sync
 ```
 
 ### Openface
 Install Openface here: https://github.com/TadasBaltrusaitis/OpenFace
 
 
-## Run experiments
+## Usage
 
 ### Facial feature extraction
 Extract facial features (AUs, gaze tracking) - may need to adjust paths:
@@ -29,7 +32,6 @@ Run RF experiment for classification (facial data):
 ```
 uv run python playground/experiment_RF.py
 ```
-
 
 
 ## Sources

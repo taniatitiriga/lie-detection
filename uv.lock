@@ -37,7 +37,6 @@ requires-dist = [
     { name = "pandas", specifier = ">=3.0.0" },
     { name = "scikit-learn", specifier = ">=1.8.0" },
 ]
-provides-extras = ["playground"]
 
 [[package]]
 name = "numpy"
