@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 
 """
-Random Forest prediction on facial AU's and eye gaze from OpenFace CSVs.
+Random Forest experiment for lie prediction on facial AU's and eye gaze from OpenFace CSVs.
 
 Usage (from repo root):
     uv run playground/experiment_rf.py --data-dir data/res --out runs/rf_exp1
-
-It:
 
 - parses labels from filenames,
 - extracts robust aggregate features (AUs, gaze, pose, landmarks — mean/std/median/IQR/mean-abs-diff, AU activation counts and blink-rate if AU45 available),
