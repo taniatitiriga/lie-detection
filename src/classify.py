@@ -14,25 +14,234 @@ Usage (from repo root):
 - writes features.csv, cv_results.json, and saves the final fitted RF model.
 """
 
+from __future__ import annotations
+
 from pathlib import Path
 import argparse
+import csv
 import json
-import joblib
 import numpy as np
-import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import StratifiedKFold, cross_val_predict
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import (
-    accuracy_score,
-    roc_auc_score,
-    f1_score,
-    precision_score,
-    recall_score,
-    confusion_matrix,
-)
-from sklearn.pipeline import Pipeline
+try:
+    import pandas as pd  # type: ignore
+except ModuleNotFoundError:
+    pd = None  # type: ignore[assignment]
+
+try:
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.model_selection import StratifiedKFold, cross_val_predict
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.metrics import (
+        accuracy_score,
+        roc_auc_score,
+        f1_score,
+        precision_score,
+        recall_score,
+        confusion_matrix,
+    )
+    from sklearn.pipeline import Pipeline
+except ModuleNotFoundError:
+    RandomForestClassifier = None  # type: ignore[assignment]
+    StratifiedKFold = None  # type: ignore[assignment]
+    cross_val_predict = None  # type: ignore[assignment]
+    StandardScaler = None  # type: ignore[assignment]
+    accuracy_score = None  # type: ignore[assignment]
+    roc_auc_score = None  # type: ignore[assignment]
+    f1_score = None  # type: ignore[assignment]
+    precision_score = None  # type: ignore[assignment]
+    recall_score = None  # type: ignore[assignment]
+    confusion_matrix = None  # type: ignore[assignment]
+    Pipeline = None  # type: ignore[assignment]
+
 from typing import Dict, Any, Tuple, List
+
+try:
+    import joblib  # type: ignore
+except ModuleNotFoundError:
+    joblib = None  # type: ignore[assignment]
+
+
+def load_features(paths: list[str]) -> tuple[np.ndarray, np.ndarray, list, list]:
+    """
+    Load each CSV in paths, align by clip_id (inner join on clip_id column).
+    Assert all CSVs have identical clip_id sets.
+    Drop clip_id, subject_id, is_deceptive from feature matrix.
+
+    Returns:
+      X: (n_clips, n_features)
+      y: (n_clips,)
+      subject_ids: list (n_clips)
+      clip_ids: list (n_clips)
+    """
+    if len(paths) == 0:
+        raise ValueError("Expected at least one CSV path in `paths`")
+
+    meta_cols = {"clip_id", "subject_id", "is_deceptive"}
+
+    merged_features_by_clip: Dict[str, List[float]] = {}
+    subject_id_by_clip: Dict[str, str] = {}
+    y_by_clip: Dict[str, int] = {}
+    clip_id_order: List[str] = []
+
+    feature_cols_seen: set[str] = set()
+    expected_clip_set: set[str] | None = None
+
+    for csv_idx, p in enumerate(paths):
+        with open(p, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            if reader.fieldnames is None:
+                raise ValueError(f"CSV has no header: {p}")
+
+            missing = meta_cols - set(reader.fieldnames)
+            if missing:
+                raise KeyError(f"File {p} is missing required columns: {sorted(missing)}")
+
+            feature_cols = [c for c in reader.fieldnames if c not in meta_cols]
+
+            overlap = feature_cols_seen.intersection(feature_cols)
+            if overlap:
+                raise ValueError(f"Overlapping feature column names across CSVs: {sorted(overlap)}")
+            feature_cols_seen |= set(feature_cols)
+
+            clip_set_this: set[str] = set()
+
+            for row in reader:
+                cid = row["clip_id"]
+                clip_set_this.add(cid)
+
+                if csv_idx == 0:
+                    clip_id_order.append(cid)
+                    subject_id_by_clip[cid] = row["subject_id"]
+                    y_by_clip[cid] = int(row["is_deceptive"])
+                    merged_features_by_clip[cid] = []
+
+                if cid not in merged_features_by_clip:
+                    raise AssertionError(
+                        f"clip_id {cid} present in CSV[{csv_idx}] but not in CSV[0]"
+                    )
+
+                vals: List[float] = []
+                for c in feature_cols:
+                    raw = row.get(c, "")
+                    vals.append(float(raw) if raw != "" else 0.0)
+                merged_features_by_clip[cid].extend(vals)
+
+        if expected_clip_set is None:
+            expected_clip_set = clip_set_this
+        else:
+            if clip_set_this != expected_clip_set:
+                raise AssertionError(
+                    "clip_id sets differ between CSVs "
+                    f"(expected {len(expected_clip_set)}, got {len(clip_set_this)})"
+                )
+
+    if expected_clip_set is None:
+        raise ValueError("No CSVs loaded")
+
+    if len(clip_id_order) != len(expected_clip_set):
+        raise AssertionError("clip_id cardinality mismatch")
+
+    first_cid = clip_id_order[0]
+    n_clips = len(clip_id_order)
+    n_features = len(merged_features_by_clip[first_cid])
+
+    X = np.zeros((n_clips, n_features), dtype=float)
+    y = np.zeros((n_clips,), dtype=int)
+    subject_ids: List[str] = []
+
+    for i, cid in enumerate(clip_id_order):
+        X[i, :] = np.asarray(merged_features_by_clip[cid], dtype=float)
+        y[i] = y_by_clip[cid]
+        subject_ids.append(subject_id_by_clip[cid])
+
+    return X, y, subject_ids, clip_id_order
+
+
+def run_loocv(
+    X: np.ndarray,
+    y: np.ndarray,
+    subject_ids: list,
+    clip_ids: list,
+    clf_factory,
+    scaler: bool = True,
+    n_runs: int = 3,
+) -> tuple[float, float, list]:
+    """
+    Subject-aware LOOCV with clip-level evaluation.
+
+    Returns:
+      mean_acc, std_acc, first_run_preds, auc (if computable else nan)
+    """
+    if StandardScaler is None or roc_auc_score is None:
+        raise ModuleNotFoundError("scikit-learn is required for run_loocv()")
+
+    unique_subjects = sorted(set(subject_ids))  # subject-level splits
+    subject_ids_arr = np.array(subject_ids)
+    clip_ids_arr = np.array(clip_ids)
+    y_arr = np.array(y, dtype=int)
+
+    all_preds: list[list[tuple]] = []  # per run
+
+    for run in range(n_runs):
+        run_preds = []
+        for subj in unique_subjects:
+            test_mask = subject_ids_arr == subj
+            train_mask = ~test_mask
+
+            # ASSERT: no subject appears in both
+            assert not np.any(subject_ids_arr[train_mask] == subj)
+
+            X_train, X_test = X[train_mask], X[test_mask]
+            y_train, y_test = y_arr[train_mask], y_arr[test_mask]
+
+            if scaler:
+                sc = StandardScaler().fit(X_train)  # fit on train only
+                X_train = sc.transform(X_train)
+                X_test = sc.transform(X_test)
+
+            clf = clf_factory(run_seed=run)
+            clf.fit(X_train, y_train)
+
+            probs = clf.predict_proba(X_test)[:, 1]
+            preds = (probs >= 0.5).astype(int)
+
+            test_indices = np.where(test_mask)[0]
+            ids = clip_ids_arr[test_indices].tolist()
+            for cid, yt, yp, pr in zip(ids, y_test, preds, probs, strict=False):
+                run_preds.append((cid, int(yt), int(yp), float(pr)))
+
+        all_preds.append(run_preds)
+
+    # Average accuracy across runs
+    run_accs = [np.mean([r[1] == r[2] for r in rp]) for rp in all_preds]
+    mean_acc = float(np.mean(run_accs))
+    std_acc = float(np.std(run_accs))
+
+    # AUC from averaged probabilities if available.
+    auc = float("nan")
+    try:
+        if len(np.unique(y_arr)) == 2:
+            # Aggregate per clip across runs
+            prob_sum: Dict[str, float] = {}
+            prob_count: Dict[str, int] = {}
+            y_by_clip: Dict[str, int] = {}
+
+            for rp in all_preds:
+                for cid, yt, _yp, pr in rp:
+                    prob_sum[cid] = prob_sum.get(cid, 0.0) + pr
+                    prob_count[cid] = prob_count.get(cid, 0) + 1
+                    y_by_clip[cid] = yt
+
+            clip_id_list = list(clip_ids)
+            probs_avg = [prob_sum[cid] / max(1, prob_count[cid]) for cid in clip_id_list]
+            y_true = [y_by_clip[cid] for cid in clip_id_list]
+            auc = float(roc_auc_score(y_true, probs_avg))
+    except Exception:
+        auc = float("nan")
+
+    label = getattr(clf_factory, "label", None) or getattr(clf_factory, "__name__", None) or clf_factory.__class__.__name__
+    print(f"[{label}] Clip-LOOCV  acc={mean_acc:.4f} ± {std_acc:.4f}  auc={auc:.4f}")
+
+    return mean_acc, std_acc, all_preds[0]
 
 
 def parse_metadata(path: Path) -> Tuple[int, int]:
@@ -172,6 +381,8 @@ def aggregate_one(csv_path: Path, conf_thr: float = 0.0) -> Dict[str, Any]:
 
 
 def build_dataset(data_dir: Path, conf_thr: float = 0.0) -> Tuple[pd.DataFrame, np.ndarray]:
+    if pd is None:
+        raise ModuleNotFoundError("pandas is required for build_dataset() / RandomForest CV path")
     rows = []
     labels = []
     csvs = sorted(data_dir.glob("trial_*.csv"))
@@ -190,6 +401,10 @@ def build_dataset(data_dir: Path, conf_thr: float = 0.0) -> Tuple[pd.DataFrame, 
 
 
 def run_cv_and_train(Xdf: pd.DataFrame, y: np.ndarray, out_dir: Path, n_splits: int = 5, random_state: int = 42) -> Dict[str, Any]:
+    if pd is None:
+        raise ModuleNotFoundError("pandas is required for run_cv_and_train() / RandomForest CV path")
+    if Pipeline is None or cross_val_predict is None or StandardScaler is None:
+        raise ModuleNotFoundError("scikit-learn is required for run_cv_and_train() / RandomForest CV path")
     out_dir.mkdir(parents=True, exist_ok=True)
     # features: drop metadata columns
     meta_cols = {"file", "trial_id"}
@@ -233,6 +448,10 @@ def run_cv_and_train(Xdf: pd.DataFrame, y: np.ndarray, out_dir: Path, n_splits: 
     # Fit final model on full data
     pipeline.fit(X, y)
     model_path = out_dir / "rf_model.joblib"
+    if joblib is None:
+        raise ModuleNotFoundError(
+            "joblib is required for saving the fitted RandomForest model in run_cv_and_train()."
+        )
     joblib.dump({"pipeline": pipeline, "feature_columns": feature_cols}, model_path)
 
     # save features & preds
@@ -256,6 +475,13 @@ def main():
     p.add_argument("--conf-thr", type=float, default=0.0, help="Confidence threshold to filter frames (0-1)")
     p.add_argument("--n-splits", type=int, default=5, help="Stratified K folds")
     p.add_argument("--random-state", type=int, default=42)
+    p.add_argument(
+        "--feature-csvs",
+        nargs="*",
+        default=None,
+        help="Optional: if provided, run subject-aware LOOCV on the aligned clip-level feature CSVs.",
+    )
+    p.add_argument("--n-runs", type=int, default=3, help="Number of repeated subject-LOOCV runs")
     args = p.parse_args()
 
     root = Path(__file__).resolve().parents[1]
@@ -264,16 +490,47 @@ def main():
 
     print(f"DATA DIR: {data_dir}")
     print(f"OUTPUT: {out_dir}")
-    print("Building dataset (this may take a moment)...")
-    Xdf, y = build_dataset(data_dir, conf_thr=args.conf_thr)
-    print(f"Found {len(Xdf)} trials. Feature vector size: {Xdf.shape[1]} (including metadata)")
+    if args.feature_csvs:
+        print("Running subject-aware Clip-LOOCV...")
+        if RandomForestClassifier is None:
+            raise ModuleNotFoundError("scikit-learn is required for subject-aware LOOCV")
+        X, y, subject_ids, clip_ids = load_features([str(Path(c).resolve()) for c in args.feature_csvs])
 
-    print("Running CV + training RandomForest...")
-    results = run_cv_and_train(Xdf, y, out_dir, n_splits=args.n_splits, random_state=args.random_state)
+        def rf_factory(run_seed: int):
+            return RandomForestClassifier(
+                n_estimators=200,
+                random_state=run_seed,
+                class_weight="balanced",
+                n_jobs=-1,
+            )
 
-    print("Results:")
-    print(json.dumps(results, indent=2))
-    print(f"Saved model+features+results to {out_dir}")
+        # Attach a label used in print formatting.
+        setattr(rf_factory, "label", "RF")
+
+        mean_acc, std_acc, first_run_preds = run_loocv(
+            X=X,
+            y=y,
+            subject_ids=subject_ids,
+            clip_ids=clip_ids,
+            clf_factory=rf_factory,
+            scaler=True,
+            n_runs=args.n_runs,
+        )
+        _ = first_run_preds  # currently unused; returned for possible downstream AUC/confusion analysis
+        print(f"Saved LOOCV summary to {out_dir} (metrics printed above)")
+    else:
+        print("Building dataset (this may take a moment)...")
+        Xdf, y = build_dataset(data_dir, conf_thr=args.conf_thr)
+        print(f"Found {len(Xdf)} trials. Feature vector size: {Xdf.shape[1]} (including metadata)")
+
+        print("Running CV + training RandomForest...")
+        results = run_cv_and_train(
+            Xdf, y, out_dir, n_splits=args.n_splits, random_state=args.random_state
+        )
+
+        print("Results:")
+        print(json.dumps(results, indent=2))
+        print(f"Saved model+features+results to {out_dir}")
 
 if __name__ == "__main__":
     main()
