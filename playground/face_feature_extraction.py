@@ -18,7 +18,7 @@ if not files:
 
 else:
     # build command
-    cmd = ["/mnt/c/users/tania/tools/openface/build/bin/FeatureExtraction"] # ignore this RIP
+    cmd = ["/mnt/c/users/tania/tools/openface/build/bin/FeatureExtraction"]
     for f in files:
         cmd.extend(["-f", str(f)])
 

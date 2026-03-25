@@ -7,7 +7,7 @@ Usage (from repo root):
     uv run playground/experiment_rf.py --data-dir data/res --out runs/rf_exp1
 
 - parses labels from filenames,
-- extracts robust aggregate features (AUs, gaze, pose, landmarks — mean/std/median/IQR/mean-abs-diff, AU activation counts and blink-rate if AU45 available),
+- extracts aggregate features (AUs, gaze, pose, landmarks — mean/std/median/IQR/mean-abs-diff, AU activation counts and blink-rate if AU45 available),
 - builds X, y,
 - runs Stratified K-Fold CV (default 5 folds),
 - reports accuracy/AUC/F1/precision/recall + confusion matrix,
@@ -21,7 +21,7 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import StratifiedKFold, cross_val_predict
+from sklearn.model_selection import StratifiedKFold, LeaveOneOut, cross_val_predict
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (
     accuracy_score,
@@ -37,8 +37,7 @@ from typing import Dict, Any, Tuple, List
 
 def parse_metadata(path: Path) -> Tuple[int, int]:
     """
-    Parse filename like: trial_lie_03.csv -> (label_int, trial_number)
-    label_int: 1 for 'lie', 0 for 'truth'
+    ex: trial_lie_03.csv -> (is_lie, vid_number)
     """
     name = path.stem
     parts = name.split("_")
@@ -49,7 +48,7 @@ def parse_metadata(path: Path) -> Tuple[int, int]:
     try:
         num_i = int(num)
     except ValueError:
-        # attempt to strip leading zeros or non-digit suffixes
+        # strip non-digit suffixes
         num_i = int(''.join(ch for ch in num if ch.isdigit()) or 0)
     return label, num_i
 
@@ -205,7 +204,7 @@ def run_cv_and_train(Xdf: pd.DataFrame, y: np.ndarray, out_dir: Path, n_splits: 
             n_jobs=-1,
         ))
     ])
-    cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    cv = LeaveOneOut()
 
     # cross_val_predict to get per-sample predictions
     y_pred = cross_val_predict(pipeline, X, y, cv=cv, method="predict", n_jobs=-1)
@@ -252,7 +251,7 @@ def run_cv_and_train(Xdf: pd.DataFrame, y: np.ndarray, out_dir: Path, n_splits: 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data-dir", type=str, default="data/extracted_AU_gaze", help="Path to folder with trial_*.csv")
-    p.add_argument("--out", type=str, default="runs/experiment_rf_001", help="Output folder to save model/results")
+    p.add_argument("--out", type=str, default="runs/experiment_rf_LOU", help="Output folder to save model/results")
     p.add_argument("--conf-thr", type=float, default=0.0, help="Confidence threshold to filter frames (0-1)")
     p.add_argument("--n-splits", type=int, default=5, help="Stratified K folds")
     p.add_argument("--random-state", type=int, default=42)
