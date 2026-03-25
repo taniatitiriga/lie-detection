@@ -1,18 +1,5 @@
 #!/usr/bin/env python3
 
-"""
-Random Forest experiment for lie prediction on facial AU's and eye gaze from OpenFace CSVs.
-
-Usage (from repo root):
-    uv run playground/experiment_rf.py --data-dir data/res --out runs/rf_exp1
-
-- parses labels from filenames,
-- extracts robust aggregate features (AUs, gaze, pose, landmarks — mean/std/median/IQR/mean-abs-diff, AU activation counts and blink-rate if AU45 available),
-- builds X, y,
-- runs Stratified K-Fold CV (default 5 folds),
-- reports accuracy/AUC/F1/precision/recall + confusion matrix,
-- writes features.csv, cv_results.json, and saves the final fitted RF model.
-"""
 
 from __future__ import annotations
 
@@ -28,8 +15,11 @@ except ModuleNotFoundError:
 
 try:
     from sklearn.ensemble import RandomForestClassifier
+    from sklearn.svm import SVC
+    from sklearn.neural_network import MLPClassifier
     from sklearn.model_selection import StratifiedKFold, cross_val_predict
     from sklearn.preprocessing import StandardScaler
+    from sklearn.dummy import DummyClassifier
     from sklearn.metrics import (
         accuracy_score,
         roc_auc_score,
@@ -41,6 +31,8 @@ try:
     from sklearn.pipeline import Pipeline
 except ModuleNotFoundError:
     RandomForestClassifier = None  # type: ignore[assignment]
+    SVC = None  # type: ignore[assignment]
+    MLPClassifier = None  # type: ignore[assignment]
     StratifiedKFold = None  # type: ignore[assignment]
     cross_val_predict = None  # type: ignore[assignment]
     StandardScaler = None  # type: ignore[assignment]
@@ -51,6 +43,12 @@ except ModuleNotFoundError:
     recall_score = None  # type: ignore[assignment]
     confusion_matrix = None  # type: ignore[assignment]
     Pipeline = None  # type: ignore[assignment]
+    DummyClassifier = None  # type: ignore[assignment]
+
+try:
+    from scipy.ndimage import uniform_filter
+except ModuleNotFoundError:
+    uniform_filter = None  # type: ignore[assignment]
 
 from typing import Dict, Any, Tuple, List
 
@@ -164,12 +162,13 @@ def run_loocv(
     clf_factory,
     scaler: bool = True,
     n_runs: int = 3,
-) -> tuple[float, float, list]:
+    silent: bool = False,
+) -> tuple[float, float, list, float]:
     """
     Subject-aware LOOCV with clip-level evaluation.
 
     Returns:
-      mean_acc, std_acc, first_run_preds, auc (if computable else nan)
+      mean_acc, std_acc, first_run_preds, auc
     """
     if StandardScaler is None or roc_auc_score is None:
         raise ModuleNotFoundError("scikit-learn is required for run_loocv()")
@@ -239,9 +238,368 @@ def run_loocv(
         auc = float("nan")
 
     label = getattr(clf_factory, "label", None) or getattr(clf_factory, "__name__", None) or clf_factory.__class__.__name__
-    print(f"[{label}] Clip-LOOCV  acc={mean_acc:.4f} ± {std_acc:.4f}  auc={auc:.4f}")
+    if not silent:
+        print(f"[{label}] Clip-LOOCV  acc={mean_acc:.4f} ± {std_acc:.4f}  auc={auc:.4f}")
 
-    return mean_acc, std_acc, all_preds[0]
+    return mean_acc, std_acc, all_preds[0], auc
+
+
+# ---------------------------------------------------------------------------
+# Classifier factories
+# ---------------------------------------------------------------------------
+
+def rf_factory(run_seed: int):
+    """Random Forest factory."""
+    return RandomForestClassifier(
+        n_estimators=100,
+        min_samples_leaf=3,
+        random_state=run_seed,
+    )
+
+rf_factory.label = "RF"  # type: ignore[attr-defined]
+
+
+def svm_factory(run_seed: int):
+    """SVM factory with per-fold 4-fold CV grid search + 3×3 mean-filter smoothing."""
+
+    class TunedSVM:
+        def __init__(self):
+            self._model = None
+
+        def fit(self, X_train, y_train):
+            C_values = [0.01, 0.1, 1, 10, 100]
+            gamma_values = [0.001, 0.01, 0.1, 1, "scale"]
+
+            n_C = len(C_values)
+            n_gamma = len(gamma_values)
+            loss_matrix = np.zeros((n_C, n_gamma))
+
+            cv = StratifiedKFold(n_splits=4, shuffle=True, random_state=run_seed)
+
+            for i, C in enumerate(C_values):
+                for j, gamma in enumerate(gamma_values):
+                    fold_errors = []
+                    for train_idx, val_idx in cv.split(X_train, y_train):
+                        Xtr, Xval = X_train[train_idx], X_train[val_idx]
+                        ytr, yval = y_train[train_idx], y_train[val_idx]
+                        clf = SVC(kernel="rbf", C=C, gamma=gamma, random_state=run_seed)
+                        clf.fit(Xtr, ytr)
+                        fold_errors.append(1.0 - accuracy_score(yval, clf.predict(Xval)))
+                    loss_matrix[i, j] = np.mean(fold_errors)
+
+            # Apply 3×3 mean filter to smooth the loss surface
+            if uniform_filter is not None:
+                loss_matrix = uniform_filter(loss_matrix, size=3, mode="nearest")
+
+            best_idx = np.unravel_index(np.argmin(loss_matrix), loss_matrix.shape)
+            best_C = C_values[best_idx[0]]
+            best_gamma = gamma_values[best_idx[1]]
+
+            self._model = SVC(
+                kernel="rbf", C=best_C, gamma=best_gamma,
+                probability=True, random_state=run_seed,
+            )
+            self._model.fit(X_train, y_train)
+
+        def predict_proba(self, X_test):
+            return self._model.predict_proba(X_test)
+
+    return TunedSVM()
+
+svm_factory.label = "SVM"  # type: ignore[attr-defined]
+
+
+def nn_factory(run_seed: int):
+    """Neural-network factory (MLP matching the 2020 paper)."""
+    return MLPClassifier(
+        hidden_layer_sizes=(100, 500),
+        activation="relu",
+        solver="adam",
+        alpha=1e-5,
+        max_iter=500,
+        random_state=run_seed,
+        early_stopping=True,
+        validation_fraction=0.1,
+    )
+
+nn_factory.label = "NN"  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# Modality loading helpers
+# ---------------------------------------------------------------------------
+
+def load_single_modality(path: str) -> np.ndarray:
+    """Load a single CSV and return only the feature columns as ndarray."""
+    meta_cols = {"clip_id", "subject_id", "is_deceptive"}
+    rows: list[list[float]] = []
+    with open(path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None:
+            raise ValueError(f"CSV has no header: {path}")
+        feature_cols = [c for c in reader.fieldnames if c not in meta_cols]
+        for row in reader:
+            vals = [float(row.get(c, "") or 0.0) for c in feature_cols]
+            rows.append(vals)
+    return np.array(rows, dtype=float)
+
+
+# ---------------------------------------------------------------------------
+# Late fusion LOOCV
+# ---------------------------------------------------------------------------
+
+def run_late_fusion_loocv(
+    X_list: list[np.ndarray],
+    y: np.ndarray,
+    subject_ids: list,
+    clip_ids: list,
+    clf_factory,
+    n_runs: int = 3,
+) -> tuple[float, float, float, float]:
+    """
+    Late fusion: train separate classifiers per modality inside each LOOCV
+    fold, collect per-clip probabilities, then sweep w_vis (weight for the
+    first modality in X_list) to find the best fusion weight.
+
+    Returns:
+      best_acc, std_acc (across runs at best weight), auc, best_w_vis
+    """
+    if StandardScaler is None or roc_auc_score is None:
+        raise ModuleNotFoundError("scikit-learn is required")
+
+    unique_subjects = sorted(set(subject_ids))
+    subject_ids_arr = np.array(subject_ids)
+    clip_ids_arr = np.array(clip_ids)
+    y_arr = np.array(y, dtype=int)
+    n_modalities = len(X_list)
+
+    # Collect per-modality, per-run, per-clip probabilities
+    # all_probs[run][modality] = dict{clip_id -> prob}
+    all_probs: list[list[Dict[str, float]]] = []
+    # all_true[run] = dict{clip_id -> true_label}
+    all_true: list[Dict[str, int]] = []
+
+    for run in range(n_runs):
+        mod_probs: list[Dict[str, float]] = [{} for _ in range(n_modalities)]
+        true_labels: Dict[str, int] = {}
+
+        for subj in unique_subjects:
+            test_mask = subject_ids_arr == subj
+            train_mask = ~test_mask
+            y_train, y_test = y_arr[train_mask], y_arr[test_mask]
+            test_indices = np.where(test_mask)[0]
+            ids = clip_ids_arr[test_indices].tolist()
+
+            for m_idx, X_m in enumerate(X_list):
+                X_train_m, X_test_m = X_m[train_mask], X_m[test_mask]
+                sc = StandardScaler().fit(X_train_m)
+                X_train_m = sc.transform(X_train_m)
+                X_test_m = sc.transform(X_test_m)
+
+                clf = clf_factory(run_seed=run)
+                clf.fit(X_train_m, y_train)
+                probs = clf.predict_proba(X_test_m)[:, 1]
+                for cid, pr in zip(ids, probs):
+                    mod_probs[m_idx][cid] = float(pr)
+
+            for cid, yt in zip(ids, y_test):
+                true_labels[cid] = int(yt)
+
+        all_probs.append(mod_probs)
+        all_true.append(true_labels)
+
+    # Weight sweep: w_vis in [0.1 .. 0.9]
+    clip_id_list = list(clip_ids)
+    w_candidates = [round(v * 0.1, 2) for v in range(1, 10)]  # 0.1 .. 0.9
+    best_w = 0.5
+    best_mean_acc = 0.0
+    best_std = 0.0
+    best_auc = float("nan")
+
+    for w_vis in w_candidates:
+        w_other = (1.0 - w_vis) / max(1, n_modalities - 1)
+        run_accs = []
+        for run in range(n_runs):
+            correct = 0
+            total = 0
+            for cid in clip_id_list:
+                fused = w_vis * all_probs[run][0][cid]
+                for m_idx in range(1, n_modalities):
+                    fused += w_other * all_probs[run][m_idx][cid]
+                pred = int(fused >= 0.5)
+                if pred == all_true[run][cid]:
+                    correct += 1
+                total += 1
+            run_accs.append(correct / max(1, total))
+        m_acc = float(np.mean(run_accs))
+        if m_acc > best_mean_acc:
+            best_mean_acc = m_acc
+            best_std = float(np.std(run_accs))
+            best_w = w_vis
+            # Compute AUC at this weight
+            try:
+                w_other_auc = (1.0 - w_vis) / max(1, n_modalities - 1)
+                fused_probs_agg: Dict[str, float] = {}
+                fused_count: Dict[str, int] = {}
+                for run in range(n_runs):
+                    for cid in clip_id_list:
+                        fp = w_vis * all_probs[run][0][cid]
+                        for m_idx in range(1, n_modalities):
+                            fp += w_other_auc * all_probs[run][m_idx][cid]
+                        fused_probs_agg[cid] = fused_probs_agg.get(cid, 0.0) + fp
+                        fused_count[cid] = fused_count.get(cid, 0) + 1
+                avg_p = [fused_probs_agg[c] / fused_count[c] for c in clip_id_list]
+                yt_list = [all_true[0][c] for c in clip_id_list]
+                best_auc = float(roc_auc_score(yt_list, avg_p))
+            except Exception:
+                best_auc = float("nan")
+
+    label = getattr(clf_factory, "label", None) or "CLF"
+    print(
+        f"[{label}] Late-fusion  acc={best_mean_acc:.4f} ± {best_std:.4f}"
+        f"  auc={best_auc:.4f}  w_vis={best_w:.1f}"
+    )
+    return best_mean_acc, best_std, best_auc, best_w
+
+
+# ---------------------------------------------------------------------------
+# Full ablation
+# ---------------------------------------------------------------------------
+
+def run_ablation(
+    vis_path: str,
+    acou_path: str,
+    ling_path: str,
+    n_runs: int = 3,
+    out_dir: str | None = None,
+) -> list[dict]:
+    """
+    Run the full ablation table (single-modality, early fusion, late fusion)
+    and return a list of result dicts.
+    """
+    # Load shared metadata (y, subject_ids, clip_ids) from any CSV
+    _, y, subject_ids, clip_ids = load_features([vis_path])
+
+    # Load per-modality feature matrices (aligned to same clip order)
+    X_vis = load_single_modality(vis_path)
+    X_acou = load_single_modality(acou_path)
+    X_ling = load_single_modality(ling_path)
+
+    modality_X = {
+        "Visual": X_vis,
+        "Acoustic": X_acou,
+        "Linguistic": X_ling,
+    }
+
+    results: list[dict] = []
+
+    def _record(modality: str, fusion: str, classifier: str,
+                mean_acc: float, std_acc: float, auc: float, **extra):
+        row = {
+            "modality": modality,
+            "fusion": fusion,
+            "classifier": classifier,
+            "mean_acc": round(mean_acc, 4),
+            "std_acc": round(std_acc, 4),
+            "auc": round(auc, 4),
+        }
+        row.update(extra)
+        results.append(row)
+
+    # --- 1. Single-modality (RF, SVM, NN) ---
+    print("\n===== Single-modality experiments =====")
+    for mod_name, X_mod in modality_X.items():
+        for factory in [rf_factory, svm_factory, nn_factory]:
+            print(f"\n--- {mod_name} / {factory.label} ---")
+            acc, std, _, auc = run_loocv(
+                X_mod, y, subject_ids, clip_ids, factory,
+                scaler=True, n_runs=n_runs,
+            )
+            _record(mod_name, "none", factory.label, acc, std, auc)
+
+    # --- 2. Two-modality early fusion (NN only per spec, but also others where noted) ---
+    two_mod_combos = [
+        ("Visual+Acoustic", X_vis, X_acou),
+        ("Visual+Linguistic", X_vis, X_ling),
+        ("Acoustic+Linguistic", X_acou, X_ling),
+    ]
+    print("\n===== Two-modality early fusion (NN) =====")
+    for combo_name, Xa, Xb in two_mod_combos:
+        X_early = np.hstack([Xa, Xb])
+        print(f"\n--- {combo_name} / early / NN ---")
+        acc, std, _, auc = run_loocv(
+            X_early, y, subject_ids, clip_ids, nn_factory,
+            scaler=True, n_runs=n_runs,
+        )
+        _record(combo_name, "early", "NN", acc, std, auc)
+
+    # --- 3. Two-modality late fusion (NN only) ---
+    print("\n===== Two-modality late fusion (NN) =====")
+    late_two_combos = [
+        ("Visual+Acoustic", [X_vis, X_acou]),
+        ("Visual+Linguistic", [X_vis, X_ling]),
+        ("Acoustic+Linguistic", [X_acou, X_ling]),
+    ]
+    for combo_name, x_list in late_two_combos:
+        print(f"\n--- {combo_name} / late / NN ---")
+        acc, std, auc, w = run_late_fusion_loocv(
+            x_list, y, subject_ids, clip_ids, nn_factory, n_runs=n_runs,
+        )
+        _record(combo_name, "late", "NN", acc, std, auc, best_w=w)
+
+    # --- 4. All three — early fusion (RF, SVM, NN) ---
+    print("\n===== All three — early fusion =====")
+    X_all_early = np.hstack([X_vis, X_acou, X_ling])
+    for factory in [rf_factory, svm_factory, nn_factory]:
+        print(f"\n--- All / early / {factory.label} ---")
+        acc, std, _, auc = run_loocv(
+            X_all_early, y, subject_ids, clip_ids, factory,
+            scaler=True, n_runs=n_runs,
+        )
+        _record("All", "early", factory.label, acc, std, auc)
+
+    # --- 5. All three — late fusion (RF, NN) ---
+    print("\n===== All three — late fusion =====")
+    for factory in [rf_factory, nn_factory]:
+        print(f"\n--- All / late / {factory.label} ---")
+        acc, std, auc, w = run_late_fusion_loocv(
+            [X_vis, X_acou, X_ling], y, subject_ids, clip_ids,
+            factory, n_runs=n_runs,
+        )
+        _record("All", "late", factory.label, acc, std, auc, best_w=w)
+
+    # --- Save CSV ---
+    if out_dir is not None:
+        out_path = Path(out_dir)
+        out_path.mkdir(parents=True, exist_ok=True)
+        csv_path = out_path / "clip_level_results.csv"
+        cols = ["modality", "fusion", "classifier", "mean_acc", "std_acc", "auc"]
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+            writer.writeheader()
+            for r in results:
+                writer.writerow(r)
+        print(f"\nResults saved to {csv_path}")
+
+    # --- Print markdown table ---
+    BASELINE_2015 = 0.7520
+    BASELINE_2020 = 0.8305
+    print("\n### Clip-level ablation results\n")
+    print("| Modality | Fusion | Clf | Acc | ±Std | AUC | Note |")
+    print("|----------|--------|-----|-----|------|-----|------|")
+    for r in results:
+        note = ""
+        if r["mean_acc"] >= BASELINE_2015:
+            note += "✓ "
+        if r["mean_acc"] >= BASELINE_2020:
+            note += "★"
+        print(
+            f"| {r['modality']:<22s} | {r['fusion']:<5s} "
+            f"| {r['classifier']:<3s} | {r['mean_acc']:.4f} | {r['std_acc']:.4f} "
+            f"| {r['auc']:.4f} | {note.strip()} |"
+        )
+
+    return results
 
 
 def parse_metadata(path: Path) -> Tuple[int, int]:
@@ -468,10 +826,134 @@ def run_cv_and_train(Xdf: pd.DataFrame, y: np.ndarray, out_dir: Path, n_splits: 
     return results
 
 
+# ---------------------------------------------------------------------------
+# Sanity checks
+# ---------------------------------------------------------------------------
+
+def run_sanity_checks(vis_path: str, acou_path: str, ling_path: str, n_runs: int = 1):
+    """Run three sanity checks on the classification pipeline."""
+    if StandardScaler is None or DummyClassifier is None:
+        raise ModuleNotFoundError("scikit-learn is required for sanity checks")
+
+    # Load data (use all three modalities, early-fused)
+    X, y, subject_ids, clip_ids = load_features([vis_path, acou_path, ling_path])
+    subject_ids_arr = np.array(subject_ids)
+    unique_subjects = sorted(set(subject_ids))
+    n_total = len(y)
+
+    failures: list[str] = []
+
+    # ------------------------------------------------------------------
+    # Check 1 — Label (subject) leakage
+    # ------------------------------------------------------------------
+    print("\n=== Check 1: Label (subject) leakage ===")
+    leakage_ok = True
+    for subj in unique_subjects:
+        test_mask = subject_ids_arr == subj
+        train_mask = ~test_mask
+        train_subjects = set(subject_ids_arr[train_mask])
+        if subj in train_subjects:
+            print(f"  FAIL  subject {subj} found in both train and test")
+            leakage_ok = False
+        else:
+            print(f"  PASS  subject {subj}  (test={int(test_mask.sum())} clips)")
+    if leakage_ok:
+        print("Check 1 PASSED: no subject leakage in any fold.")
+    else:
+        failures.append("Check 1: subject leakage detected")
+
+    # ------------------------------------------------------------------
+    # Check 2 — Scaler leakage
+    # ------------------------------------------------------------------
+    print("\n=== Check 2: Scaler leakage ===")
+    scaler_ok = True
+    for subj in unique_subjects:
+        test_mask = subject_ids_arr == subj
+        train_mask = ~test_mask
+        X_train, X_test = X[train_mask], X[test_mask]
+        n_train = X_train.shape[0]
+        n_test = X_test.shape[0]
+
+        sc = StandardScaler()
+        sc.fit(X_train)
+        # Verify scaler saw only train samples
+        assert sc.n_samples_seen_ is not None
+        n_seen = int(sc.n_samples_seen_) if np.isscalar(sc.n_samples_seen_) else int(sc.n_samples_seen_[0])
+        if n_seen != n_train:
+            print(f"  FAIL  subject {subj}: scaler fit on {n_seen} samples, expected {n_train}")
+            scaler_ok = False
+        else:
+            if subj == unique_subjects[0] or subj == unique_subjects[-1]:
+                print(f"  PASS  subject {subj}: scaler fit on {n_seen} samples (not {n_total})")
+
+        # Also verify transform doesn't change shape
+        X_train_t = sc.transform(X_train)
+        X_test_t = sc.transform(X_test)
+        assert X_train_t.shape == X_train.shape
+        assert X_test_t.shape == X_test.shape
+
+    if scaler_ok:
+        print(f"Check 2 PASSED: StandardScaler always fit on N_train only (not {n_total}).")
+    else:
+        failures.append("Check 2: scaler leakage detected")
+
+    # ------------------------------------------------------------------
+    # Check 3 — Chance (dummy) baseline
+    # ------------------------------------------------------------------
+    print("\n=== Check 3: Chance baseline ===")
+
+    def dummy_factory(run_seed: int):
+        return DummyClassifier(strategy="most_frequent")
+    dummy_factory.label = "Dummy"  # type: ignore[attr-defined]
+
+    dummy_acc, dummy_std, _, dummy_auc = run_loocv(
+        X, y, subject_ids, clip_ids,
+        clf_factory=dummy_factory,
+        scaler=False,  # scaler irrelevant for dummy
+        n_runs=1,
+        silent=True,
+    )
+    majority_frac = max(np.mean(y), 1 - np.mean(y))
+    print(f"  Dummy baseline:  acc={dummy_acc:.4f} (expected ~{majority_frac:.4f})")
+
+    # Compare against real classifiers
+    real_accs = {}
+    for factory in [rf_factory, nn_factory]:
+        acc, _, _, _ = run_loocv(
+            X, y, subject_ids, clip_ids, factory,
+            scaler=True, n_runs=n_runs, silent=True,
+        )
+        real_accs[factory.label] = acc
+
+    dummy_beats_real = []
+    for name, acc in real_accs.items():
+        print(f"  {name} acc={acc:.4f}  {'< dummy (!)' if acc < dummy_acc else '>= dummy (ok)'}")
+        if acc < dummy_acc:
+            dummy_beats_real.append(name)
+
+    if dummy_beats_real:
+        failures.append(f"Check 3: dummy beats {', '.join(dummy_beats_real)}")
+        print(f"Check 3 WARNING: dummy classifier beats: {', '.join(dummy_beats_real)}")
+    else:
+        print("Check 3 PASSED: no real classifier is beaten by dummy.")
+
+    # ------------------------------------------------------------------
+    # Summary
+    # ------------------------------------------------------------------
+    print()
+    if not failures:
+        print("All sanity checks passed.")
+    else:
+        print("FAILURES:")
+        for f in failures:
+            print(f"  - {f}")
+    return len(failures) == 0
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data-dir", type=str, default="data/extracted_AU_gaze", help="Path to folder with trial_*.csv")
-    p.add_argument("--out", type=str, default="runs/experiment_rf_001", help="Output folder to save model/results")
+    p.add_argument("--out", type=str, default="runs/nn_experiment", help="Output folder to save model/results")
     p.add_argument("--conf-thr", type=float, default=0.0, help="Confidence threshold to filter frames (0-1)")
     p.add_argument("--n-splits", type=int, default=5, help="Stratified K folds")
     p.add_argument("--random-state", type=int, default=42)
@@ -482,6 +964,19 @@ def main():
         help="Optional: if provided, run subject-aware LOOCV on the aligned clip-level feature CSVs.",
     )
     p.add_argument("--n-runs", type=int, default=3, help="Number of repeated subject-LOOCV runs")
+    p.add_argument(
+        "--ablation",
+        action="store_true",
+        default=False,
+        help="Run full ablation table (early+late fusion, all classifiers)."
+             " Expects features/visual.csv, features/acoustic.csv, features/linguistic.csv.",
+    )
+    p.add_argument(
+        "--sanity",
+        action="store_true",
+        default=False,
+        help="Run sanity checks (leakage, scaler, dummy baseline).",
+    )
     args = p.parse_args()
 
     root = Path(__file__).resolve().parents[1]
@@ -490,33 +985,48 @@ def main():
 
     print(f"DATA DIR: {data_dir}")
     print(f"OUTPUT: {out_dir}")
-    if args.feature_csvs:
+
+    if args.sanity:
+        feat_dir = root / "features"
+        run_sanity_checks(
+            vis_path=str((feat_dir / "visual.csv").resolve()),
+            acou_path=str((feat_dir / "acoustic.csv").resolve()),
+            ling_path=str((feat_dir / "linguistic.csv").resolve()),
+            n_runs=args.n_runs,
+        )
+
+    elif args.ablation:
+        if RandomForestClassifier is None:
+            raise ModuleNotFoundError("scikit-learn is required for ablation")
+        feat_dir = root / "features"
+        vis_path = str((feat_dir / "visual.csv").resolve())
+        acou_path = str((feat_dir / "acoustic.csv").resolve())
+        ling_path = str((feat_dir / "linguistic.csv").resolve())
+        print(f"Running full ablation (n_runs={args.n_runs}) ...")
+        run_ablation(
+            vis_path=vis_path,
+            acou_path=acou_path,
+            ling_path=ling_path,
+            n_runs=args.n_runs,
+            out_dir=str(out_dir),
+        )
+
+    elif args.feature_csvs:
         print("Running subject-aware Clip-LOOCV...")
         if RandomForestClassifier is None:
             raise ModuleNotFoundError("scikit-learn is required for subject-aware LOOCV")
         X, y, subject_ids, clip_ids = load_features([str(Path(c).resolve()) for c in args.feature_csvs])
 
-        def rf_factory(run_seed: int):
-            return RandomForestClassifier(
-                n_estimators=200,
-                random_state=run_seed,
-                class_weight="balanced",
-                n_jobs=-1,
+        for factory in [rf_factory, svm_factory, nn_factory]:
+            run_loocv(
+                X=X,
+                y=y,
+                subject_ids=subject_ids,
+                clip_ids=clip_ids,
+                clf_factory=factory,
+                scaler=True,
+                n_runs=args.n_runs,
             )
-
-        # Attach a label used in print formatting.
-        setattr(rf_factory, "label", "RF")
-
-        mean_acc, std_acc, first_run_preds = run_loocv(
-            X=X,
-            y=y,
-            subject_ids=subject_ids,
-            clip_ids=clip_ids,
-            clf_factory=rf_factory,
-            scaler=True,
-            n_runs=args.n_runs,
-        )
-        _ = first_run_preds  # currently unused; returned for possible downstream AUC/confusion analysis
         print(f"Saved LOOCV summary to {out_dir} (metrics printed above)")
     else:
         print("Building dataset (this may take a moment)...")
