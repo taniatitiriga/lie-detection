@@ -146,7 +146,6 @@ thresholded at 0.5.
 ## Sources
 
 Dataset: [https://web.eecs.umich.edu/~mihalcea/papers/perezrosas.icmi15.pdf](https://web.eecs.umich.edu/~mihalcea/papers/perezrosas.icmi15.pdf)  
-Replication target: Sen et al., *Multimodal Deception Detection*, 2020
 
 Facial expression recognition: [https://www.cl.cam.ac.uk/research/rainbow/projects/openface/wacv2016.pdf](https://www.cl.cam.ac.uk/research/rainbow/projects/openface/wacv2016.pdf)
 
