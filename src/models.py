@@ -82,22 +82,18 @@ svm_factory.label = "SVM"  # type: ignore[attr-defined]
 
 
 def nn_factory(run_seed: int):
-    """Neural-network factory — compact MLP regularised for ~89 training samples.
+    """Neural-network factory — matches the paper's original implementation.
 
-    Architecture reduced from (100, 500) to (64, 32) to avoid extreme
-    overparameterisation (~51 k → ~3.5 k parameters).  Stronger L2 (alpha=1e-3),
-    a larger validation fraction for early stopping, and more iterations to
-    compensate for slower convergence under stronger regularisation.
+    Architecture parameters set to match: "two hidden layers network (100 and
+    500 nodes for the hidden layers) ... L2 regularization is applied with a
+    weight of 1E-5, to prevent over-fitting."
     """
     return MLPClassifier(
-        hidden_layer_sizes=(64, 32),
+        hidden_layer_sizes=(100, 500),
         activation="relu",
         solver="adam",
-        alpha=1e-3,
-        max_iter=1000,
+        alpha=1e-5,
         random_state=run_seed,
-        early_stopping=True,
-        validation_fraction=0.15,
     )
 
 nn_factory.label = "NN"  # type: ignore[attr-defined]
