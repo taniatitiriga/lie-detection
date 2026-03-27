@@ -4,8 +4,8 @@ from pathlib import Path
 # Automatization for face feature extraction from dataset. Only run once.
 
 # paths
-INPUT_DIR = Path("/data/raw_videos")
-OUTPUT_DIR = Path("/data/extracted_AU_gaze")
+INPUT_DIR = Path("data/raw_videos")
+OUTPUT_DIR = Path("data/extracted_AU_gaze")
 
 # collect media files
 files = sorted(

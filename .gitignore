@@ -222,3 +222,11 @@ data/extracted_AU_gaze/*.avi
 data/extracted_AU_gaze/*.hog
 data/extracted_AU_gaze/*.txt
 data/extracted_AU_gaze/*aligned
+
+# runs
+runs/*
+
+# papers
+*.pdf
+
+

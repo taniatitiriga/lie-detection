@@ -114,6 +114,125 @@ def _extract_pitch_stats(wav_path: Path) -> Tuple[float, float]:
     return pitch_mean, pitch_stdv
 
 
+def _safe(val: object) -> float:
+    """Return val as float, or 0.0 if it is NaN / None / raises."""
+    import math
+    try:
+        v = float(val)  # type: ignore[arg-type]
+        return 0.0 if math.isnan(v) or math.isinf(v) else v
+    except Exception:
+        return 0.0
+
+
+def _extract_intensity_stats(wav_path: Path) -> Tuple[float, float]:
+    """
+    Compute mean and std of the intensity (energy) contour in dB.
+
+    Returns (intensity_mean, intensity_std), both 0.0 on failure.
+    """
+    import numpy as np
+    import parselmouth
+
+    try:
+        snd = parselmouth.Sound(str(wav_path))
+        intensity = snd.to_intensity()
+        vals = intensity.values.flatten()
+        vals = vals[~np.isnan(vals)]
+        if len(vals) == 0:
+            return 0.0, 0.0
+        return _safe(np.mean(vals)), _safe(np.std(vals))
+    except Exception:
+        return 0.0, 0.0
+
+
+def _extract_jitter_local(wav_path: Path) -> float:
+    """
+    Compute local (cycle-to-cycle) jitter via a Praat PointProcess.
+
+    Returns 0.0 on failure (silent clip, too-short clip, etc.).
+    """
+    import parselmouth
+    from parselmouth.praat import call
+
+    try:
+        snd = parselmouth.Sound(str(wav_path))
+        pitch = snd.to_pitch()
+        pp = call(snd, "To PointProcess (periodic, cc)", 75, 500)
+        jitter = call(pp, "Get jitter (local)", 0, 0, 0.0001, 0.02, 1.3)
+        return _safe(jitter)
+    except Exception:
+        return 0.0
+
+
+def _extract_shimmer_local(wav_path: Path) -> float:
+    """
+    Compute local shimmer (amplitude perturbation) via Sound + PointProcess.
+
+    Returns 0.0 on failure.
+    """
+    import parselmouth
+    from parselmouth.praat import call
+
+    try:
+        snd = parselmouth.Sound(str(wav_path))
+        pp = call(snd, "To PointProcess (periodic, cc)", 75, 500)
+        shimmer = call(
+            [snd, pp],
+            "Get shimmer (local)",
+            0, 0, 0.0001, 0.02, 1.3, 1.6,
+        )
+        return _safe(shimmer)
+    except Exception:
+        return 0.0
+
+
+def _extract_hnr_mean(wav_path: Path) -> float:
+    """
+    Compute mean Harmonics-to-Noise Ratio over the clip.
+
+    Returns 0.0 on failure.
+    """
+    import parselmouth
+    from parselmouth.praat import call
+
+    try:
+        snd = parselmouth.Sound(str(wav_path))
+        harmonicity = call(snd, "To Harmonicity (cc)", 0.01, 75, 0.1, 1.0)
+        hnr = call(harmonicity, "Get mean", 0, 0)
+        return _safe(hnr)
+    except Exception:
+        return 0.0
+
+
+def _extract_speaking_rate_and_f0_frac(wav_path: Path) -> Tuple[float, float]:
+    """
+    Compute two features from the pitch contour:
+
+    * speaking_rate  — voiced frames / clip duration (Hz proxy for speaking rate)
+    * f0_voiced_frac — fraction of pitch frames where f0 > 0
+
+    Both return 0.0 on failure.
+    """
+    import parselmouth
+
+    try:
+        snd = parselmouth.Sound(str(wav_path))
+        duration = snd.duration  # seconds
+        if duration <= 0:
+            return 0.0, 0.0
+
+        pitch_obj = snd.to_pitch()
+        f0 = pitch_obj.selected_array["frequency"]
+        total_frames = len(f0)
+        voiced_frames = int((f0 > 0).sum())
+
+        speaking_rate = _safe(voiced_frames / duration)
+        f0_voiced_frac = _safe(voiced_frames / total_frames) if total_frames > 0 else 0.0
+        return speaking_rate, f0_voiced_frac
+    except Exception:
+        return 0.0, 0.0
+
+
 def _vad_histograms_webrtcvad(wav_path: Path) -> Tuple[List[float], List[float]]:
     # `webrtcvad` imports `pkg_resources` only to read its own version.
     # Some environments (including this one) don't ship `pkg_resources`,
@@ -259,6 +378,15 @@ def compute_acoustic_features(
         ["clip_id", "subject_id", "is_deceptive", "pitch_mean", "pitch_stdv"]
         + [f"sil_hist_{i:02d}" for i in range(25)]
         + [f"sp_hist_{i:02d}" for i in range(25)]
+        + [
+            "intensity_mean",
+            "intensity_std",
+            "jitter_local",
+            "shimmer_local",
+            "hnr_mean",
+            "speaking_rate",
+            "f0_voiced_frac",
+        ]
     )
 
     rows: List[List[object]] = []
@@ -268,9 +396,19 @@ def compute_acoustic_features(
         wav_path = wav_dir / f"{stem}.wav"
 
         pitch_mean, pitch_stdv = _extract_pitch_stats(wav_path)
-        print(f"Subject {subject_id_by_clip[clip_id]} | {clip_id}: pitch_stdv={pitch_stdv:.2f}")
-
         sil_hist, sp_hist = _vad_histograms_webrtcvad(wav_path)
+        intensity_mean, intensity_std = _extract_intensity_stats(wav_path)
+        jitter_local = _extract_jitter_local(wav_path)
+        shimmer_local = _extract_shimmer_local(wav_path)
+        hnr_mean = _extract_hnr_mean(wav_path)
+        speaking_rate, f0_voiced_frac = _extract_speaking_rate_and_f0_frac(wav_path)
+
+        print(
+            f"[{clip_idx}/{len(clip_ids)}] {subject_id_by_clip[clip_id]} | {clip_id}: "
+            f"pitch_stdv={pitch_stdv:.2f}  intensity={intensity_mean:.1f}dB  "
+            f"jitter={jitter_local:.4f}  shimmer={shimmer_local:.4f}  "
+            f"hnr={hnr_mean:.2f}  sr={speaking_rate:.1f}  vf={f0_voiced_frac:.3f}"
+        )
 
         row: List[object] = [
             clip_id,
@@ -280,6 +418,13 @@ def compute_acoustic_features(
             pitch_stdv,
             *sil_hist,
             *sp_hist,
+            intensity_mean,
+            intensity_std,
+            jitter_local,
+            shimmer_local,
+            hnr_mean,
+            speaking_rate,
+            f0_voiced_frac,
         ]
         rows.append(row)
 
@@ -288,7 +433,8 @@ def compute_acoustic_features(
         writer.writerow(header)
         writer.writerows(rows)
 
-    print(f"Done — {output_csv_path.as_posix()} written ({len(rows)} rows, 52 features)")
+    n_feat = len(header) - 3  # subtract clip_id, subject_id, is_deceptive
+    print(f"Done — {output_csv_path.as_posix()} written ({len(rows)} rows, {n_feat} features)")
 
 
 if __name__ == "__main__":
