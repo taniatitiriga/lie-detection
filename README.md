@@ -82,7 +82,7 @@ clip count) to avoid bias toward subjects with many clips (e.g. S003 with 27% of
 
 ```
 uv run python src/main.py \
-  --feature-csvs features/visual.csv features/acoustic.csv features/linguistic.csv \
+  --feature-csvs features/facial.csv features/visual.csv features/acoustic.csv features/linguistic.csv \
   --n-runs 3
 ```
 
@@ -91,7 +91,7 @@ per subject → binary prediction) alongside the clip-level result:
 
 ```
 uv run python src/main.py \
-  --feature-csvs features/visual.csv features/acoustic.csv features/linguistic.csv \
+  --feature-csvs features/facial.csv features/visual.csv features/acoustic.csv features/linguistic.csv \
   --n-runs 3 --subject-level
 ```
 
@@ -105,7 +105,7 @@ Saves `clip_level_results.csv` (column `eval_level=clip`):
 uv run python src/main.py --ablation --n-runs 3 --out runs/my_experiment
 ```
 
-Reads from `features/visual.csv`, `features/acoustic.csv`, `features/linguistic.csv` automatically.
+Reads from `features/facial.csv`, `features/visual.csv`, `features/acoustic.csv`, `features/linguistic.csv` automatically.
 
 Add `--subject-level` to append subject-level majority-vote rows (`eval_level=subject`) to
 the same CSV:

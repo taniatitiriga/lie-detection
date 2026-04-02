@@ -17,6 +17,7 @@ from evaluation import run_loocv, run_late_fusion_loocv
 
 def run_ablation(
     vis_path: str,
+    fac_path: str,
     acou_path: str,
     ling_path: str,
     n_runs: int = 3,
@@ -35,6 +36,8 @@ def run_ablation(
 
     # Load per-modality feature matrices (aligned to same clip order)
     X_vis = load_single_modality(vis_path)
+    # X_fac_base = load_single_modality(fac_path)
+    # X_vis = np.hstack([X_vis_base, X_fac_base])
     X_acou = load_single_modality(acou_path)
     X_ling = load_single_modality(ling_path)
 

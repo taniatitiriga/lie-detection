@@ -300,7 +300,7 @@ def run_late_fusion_loocv(
     return best_mean_acc, best_std, best_auc, best_w
 
 
-def run_sanity_checks(vis_path: str, acou_path: str, ling_path: str, n_runs: int = 1):
+def run_sanity_checks(vis_path: str, fac_path: str, acou_path: str, ling_path: str, n_runs: int = 1):
     """Run three sanity checks on the classification pipeline."""
     if StandardScaler is None or DummyClassifier is None:
         raise ModuleNotFoundError("scikit-learn is required for sanity checks")

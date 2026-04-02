@@ -25,12 +25,12 @@ def main():
 examples:
   # Subject-aware LOOCV on pre-built feature CSVs (RF + SVM + NN):
   uv run python src/main.py \\
-      --feature-csvs features/visual.csv features/acoustic.csv features/linguistic.csv \\
+      --feature-csvs features/facial.csv features/visual.csv features/acoustic.csv features/linguistic.csv \\
       --n-runs 3
 
   # Same, also report subject-level majority-vote accuracy:
   uv run python src/main.py \\
-      --feature-csvs features/visual.csv features/acoustic.csv features/linguistic.csv \\
+      --feature-csvs features/facial.csv features/visual.csv features/acoustic.csv features/linguistic.csv \\
       --n-runs 3 --subject-level
 
   # Full ablation table saved to runs/my_experiment/clip_level_results.csv:
@@ -57,7 +57,7 @@ examples:
         action="store_true",
         default=False,
         help="Run full ablation table (single-modality, early+late fusion, all classifiers)."
-             " Reads features/visual.csv, features/acoustic.csv, features/linguistic.csv."
+             " Reads features/facial.csv, features/visual.csv, features/acoustic.csv, features/linguistic.csv."
              " Saves clip_level_results.csv to --out.",
     )
     p.add_argument(
@@ -85,6 +85,7 @@ examples:
         feat_dir = root / "features"
         run_sanity_checks(
             vis_path=str((feat_dir / "visual.csv").resolve()),
+            fac_path=str((feat_dir / "facial.csv").resolve()),
             acou_path=str((feat_dir / "acoustic.csv").resolve()),
             ling_path=str((feat_dir / "linguistic.csv").resolve()),
             n_runs=args.n_runs,
@@ -95,11 +96,13 @@ examples:
             raise ModuleNotFoundError("scikit-learn is required for ablation")
         feat_dir = root / "features"
         vis_path = str((feat_dir / "visual.csv").resolve())
+        # fac_path = str((feat_dir / "facial.csv").resolve())
         acou_path = str((feat_dir / "acoustic.csv").resolve())
         ling_path = str((feat_dir / "linguistic.csv").resolve())
         print(f"Running full ablation (n_runs={args.n_runs}) ...")
         run_ablation(
             vis_path=vis_path,
+            # fac_path=fac_path,
             acou_path=acou_path,
             ling_path=ling_path,
             n_runs=args.n_runs,
