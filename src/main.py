@@ -111,13 +111,15 @@ examples:
         )
 
     elif args.feature_csvs:
+        import csv
         print("Running subject-aware Clip-LOOCV (macro-averaged fold accuracy)...")
         if RandomForestClassifier is None:
             raise ModuleNotFoundError("scikit-learn is required for subject-aware LOOCV")
         X, y, subject_ids, clip_ids = load_features([str(Path(c).resolve()) for c in args.feature_csvs])
 
+        results = []
         for factory in [rf_factory, svm_factory, nn_factory]:
-            run_loocv(
+            mean_acc, std_acc, _, auc, subj_mean, subj_std = run_loocv(
                 X=X,
                 y=y,
                 subject_ids=subject_ids,
@@ -127,7 +129,33 @@ examples:
                 n_runs=args.n_runs,
                 subject_level=args.subject_level,
             )
-        print("(metrics printed above)")
+            classifier_label = getattr(factory, "label", getattr(factory, "__name__", "CLF"))
+            results.append({
+                "eval_level": "clip",
+                "classifier": classifier_label,
+                "mean_acc": round(mean_acc, 4),
+                "std_acc": round(std_acc, 4),
+                "auc": round(auc, 4) if auc == auc else float("nan"),
+            })
+            if args.subject_level:
+                results.append({
+                    "eval_level": "subject",
+                    "classifier": classifier_label,
+                    "mean_acc": round(subj_mean, 4),
+                    "std_acc": round(subj_std, 4),
+                    "auc": float("nan"),
+                })
+        
+        out_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = out_dir / "custom_features_results.csv"
+        cols = ["eval_level", "classifier", "mean_acc", "std_acc", "auc"]
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=cols)
+            writer.writeheader()
+            for r in results:
+                writer.writerow(r)
+                
+        print(f"\nResults saved to {csv_path}")
     else:
         p.print_help()
 

@@ -10,15 +10,12 @@ try:
     from sklearn.preprocessing import StandardScaler
     from sklearn.dummy import DummyClassifier
     from sklearn.calibration import CalibratedClassifierCV
-    from sklearn.feature_selection import SelectKBest, f_classif
     from sklearn.metrics import roc_auc_score
 except ModuleNotFoundError:
     RandomForestClassifier = None  # type: ignore[assignment]
     StandardScaler = None  # type: ignore[assignment]
     DummyClassifier = None  # type: ignore[assignment]
     CalibratedClassifierCV = None  # type: ignore[assignment]
-    SelectKBest = None  # type: ignore[assignment]
-    f_classif = None  # type: ignore[assignment]
     roc_auc_score = None  # type: ignore[assignment]
 
 from data_loader import load_features
@@ -79,13 +76,7 @@ def run_loocv(
                 X_train = sc.transform(X_train)
                 X_test = sc.transform(X_test)
 
-            # In-fold feature selection: keep at most 50 best features
-            # (avoids curse of dimensionality, e.g. 145-dim linguistic feats)
-            if SelectKBest is not None and f_classif is not None:
-                k = min(X_train.shape[1], 50)
-                selector = SelectKBest(f_classif, k=k).fit(X_train, y_train)
-                X_train = selector.transform(X_train)
-                X_test = selector.transform(X_test)
+
 
             clf = clf_factory(run_seed=run)
             clf.fit(X_train, y_train)
@@ -143,7 +134,9 @@ def run_loocv(
         print(f"[{label}] Clip-LOOCV (macro)  acc={mean_acc:.4f} ± {std_acc:.4f}  auc={auc:.4f}")
 
     # --- Change 3 (part): Subject-level majority-vote accuracy ---
-    if subject_level and not silent:
+    subj_mean = float("nan")
+    subj_std = float("nan")
+    if subject_level:
         # For each run, average posteriors per subject → subject-level prediction
         def _subj_acc(run_preds: list) -> float:
             subj_prob_sum: Dict[str, float] = {}
@@ -164,9 +157,10 @@ def run_loocv(
         subj_run_accs = [_subj_acc(rp) for rp in all_preds]
         subj_mean = float(np.mean(subj_run_accs))
         subj_std = float(np.std(subj_run_accs))
-        print(f"[{label}] Subj-LOOCV (majority-vote)  acc={subj_mean:.4f} ± {subj_std:.4f}")
+        if not silent:
+            print(f"[{label}] Subj-LOOCV (majority-vote)  acc={subj_mean:.4f} ± {subj_std:.4f}")
 
-    return mean_acc, std_acc, all_preds[0], auc
+    return mean_acc, std_acc, all_preds[0], auc, subj_mean, subj_std
 
 
 def run_late_fusion_loocv(
@@ -219,12 +213,7 @@ def run_late_fusion_loocv(
 
                 clf = clf_factory(run_seed=run)
 
-                # In-fold feature selection for late fusion
-                if SelectKBest is not None and f_classif is not None:
-                    k = min(X_train_m.shape[1], 50)
-                    selector = SelectKBest(f_classif, k=k).fit(X_train_m, y_train)
-                    X_train_m = selector.transform(X_train_m)
-                    X_test_m = selector.transform(X_test_m)
+
 
                 # Wrap SVM and MLP with probability calibration (late-fusion only).
                 # RF produces well-calibrated probabilities via voting; skip it.
@@ -376,7 +365,7 @@ def run_sanity_checks(vis_path: str, fac_path: str, acou_path: str, ling_path: s
         return DummyClassifier(strategy="most_frequent")
     dummy_factory.label = "Dummy"  # type: ignore[attr-defined]
 
-    dummy_acc, dummy_std, _, dummy_auc = run_loocv(
+    dummy_acc, dummy_std, _, dummy_auc, _, _ = run_loocv(
         X, y, subject_ids, clip_ids,
         clf_factory=dummy_factory,
         scaler=False,  # scaler irrelevant for dummy
@@ -389,7 +378,7 @@ def run_sanity_checks(vis_path: str, fac_path: str, acou_path: str, ling_path: s
     # Compare against real classifiers
     real_accs = {}
     for factory in [rf_factory, nn_factory]:
-        acc, _, _, _ = run_loocv(
+        acc, _, _, _, _, _ = run_loocv(
             X, y, subject_ids, clip_ids, factory,
             scaler=True, n_runs=n_runs, silent=True,
         )

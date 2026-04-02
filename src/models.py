@@ -25,7 +25,7 @@ def rf_factory(run_seed: int):
     """Random Forest factory."""
     return RandomForestClassifier(
         n_estimators=100,
-        min_samples_leaf=5,
+        min_samples_leaf=3,
         random_state=run_seed,
     )
 
