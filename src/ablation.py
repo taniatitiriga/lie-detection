@@ -10,14 +10,13 @@ try:
 except ModuleNotFoundError:
     StandardScaler = None  # type: ignore[assignment]
 
-from data_loader import load_features, load_single_modality
+from data_loader import load_features
 from models import rf_factory, svm_factory, nn_factory
 from evaluation import run_loocv, run_late_fusion_loocv
 
 
 def run_ablation(
     vis_path: str,
-    # fac_path: str,
     acou_path: str,
     ling_path: str,
     n_runs: int = 3,
@@ -31,15 +30,18 @@ def run_ablation(
     When subject_level=True an extra block of subject-level majority-vote rows
     is appended to the returned list (and saved to the CSV under eval_level='subject').
     """
-    # Load shared metadata (y, subject_ids, clip_ids) from any CSV
-    _, y, subject_ids, clip_ids = load_features([vis_path])
+    # Load each modality via load_features so clip_id alignment is enforced.
+    # Use the visual CSV's ordering as the canonical clip order, then reindex
+    # acoustic and linguistic to match it.
+    X_vis, y, subject_ids, clip_ids = load_features([vis_path])
 
-    # Load per-modality feature matrices (aligned to same clip order)
-    X_vis = load_single_modality(vis_path)
-    # X_fac_base = load_single_modality(fac_path)
-    # X_vis = np.hstack([X_vis_base, X_fac_base])
-    X_acou = load_single_modality(acou_path)
-    X_ling = load_single_modality(ling_path)
+    X_acou, _, _, acou_clip_ids = load_features([acou_path])
+    acou_idx = {cid: i for i, cid in enumerate(acou_clip_ids)}
+    X_acou = X_acou[[acou_idx[cid] for cid in clip_ids]]
+
+    X_ling, _, _, ling_clip_ids = load_features([ling_path])
+    ling_idx = {cid: i for i, cid in enumerate(ling_clip_ids)}
+    X_ling = X_ling[[ling_idx[cid] for cid in clip_ids]]
 
     modality_X = {
         "Visual": X_vis,
@@ -74,8 +76,6 @@ def run_ablation(
                 scaler=True, n_runs=n_runs, subject_level=subject_level,
             )
             _record(mod_name, "none", factory.label, acc, std, auc, eval_level="clip")
-            if subject_level:
-                _record(mod_name, "none", factory.label, s_acc, s_std, float("nan"), eval_level="subject")
 
     # --- 2. Two-modality early fusion (NN only per spec, but also others where noted) ---
     two_mod_combos = [
@@ -92,8 +92,6 @@ def run_ablation(
             scaler=True, n_runs=n_runs, subject_level=subject_level,
         )
         _record(combo_name, "early", "NN", acc, std, auc, eval_level="clip")
-        if subject_level:
-            _record(combo_name, "early", "NN", s_acc, s_std, float("nan"), eval_level="subject")
 
     # --- 3. Two-modality late fusion (NN only) ---
     print("\n===== Two-modality late fusion (NN) =====")
@@ -119,8 +117,6 @@ def run_ablation(
             scaler=True, n_runs=n_runs, subject_level=subject_level,
         )
         _record("All", "early", factory.label, acc, std, auc, eval_level="clip")
-        if subject_level:
-            _record("All", "early", factory.label, s_acc, s_std, float("nan"), eval_level="subject")
 
     # --- 5. All three — late fusion (RF, NN) ---
     print("\n===== All three — late fusion =====")
@@ -132,7 +128,60 @@ def run_ablation(
         )
         _record("All", "late", factory.label, acc, std, auc, eval_level="clip", best_w=w)
 
-    # --- Remove Change 3 subject-level majority-vote block ---
+    # --- Change 3: Subject-level majority-vote rows ---
+    if subject_level:
+        print("\n===== Subject-level majority-vote accuracy =====")
+        subject_ids_arr = np.array(subject_ids)
+        clip_id_list = list(clip_ids)
+
+        def _subj_level_acc_for(
+            X_m: np.ndarray, factory, n_runs: int
+        ) -> tuple[float, float]:
+            """Return (mean_subj_acc, std_subj_acc) across runs."""
+            unique_subjects = sorted(set(subject_ids))
+            run_accs: list[float] = []
+            for run in range(n_runs):
+                subj_prob_sum: Dict[str, float] = {}
+                subj_prob_cnt: Dict[str, int] = {}
+                subj_true: Dict[str, int] = {}
+                for subj in unique_subjects:
+                    test_mask = subject_ids_arr == subj
+                    train_mask = ~test_mask
+                    X_train, X_test = X_m[train_mask], X_m[test_mask]
+                    y_train = np.array(y)[train_mask]
+                    y_test = np.array(y)[test_mask]
+                    sc = StandardScaler().fit(X_train)
+                    X_train = sc.transform(X_train)
+                    X_test = sc.transform(X_test)
+                    clf = factory(run_seed=run)
+                    clf.fit(X_train, y_train)
+                    probs = clf.predict_proba(X_test)[:, 1]
+                    test_indices = np.where(test_mask)[0]
+                    ids = [clip_id_list[i] for i in test_indices]
+                    for cid, pr, yt in zip(ids, probs, y_test):
+                        subj_prob_sum[subj] = subj_prob_sum.get(subj, 0.0) + pr
+                        subj_prob_cnt[subj] = subj_prob_cnt.get(subj, 0) + 1
+                        subj_true[subj] = int(yt)
+                correct = sum(
+                    int((subj_prob_sum[s] / subj_prob_cnt[s] >= 0.5) == subj_true[s])
+                    for s in subj_true
+                )
+                run_accs.append(correct / max(1, len(subj_true)))
+            return float(np.mean(run_accs)), float(np.std(run_accs))
+
+        for mod_name, X_mod in modality_X.items():
+            for factory in [rf_factory, svm_factory, nn_factory]:
+                s_acc, s_std = _subj_level_acc_for(X_mod, factory, n_runs)
+                print(f"[{factory.label}] {mod_name} Subj-acc={s_acc:.4f} ± {s_std:.4f}")
+                _record(mod_name, "none", factory.label,
+                        s_acc, s_std, float("nan"), eval_level="subject")
+
+        # All-three early fusion
+        for factory in [rf_factory, svm_factory, nn_factory]:
+            s_acc, s_std = _subj_level_acc_for(X_all_early, factory, n_runs)
+            print(f"[{factory.label}] All/early Subj-acc={s_acc:.4f} ± {s_std:.4f}")
+            _record("All", "early", factory.label,
+                    s_acc, s_std, float("nan"), eval_level="subject")
 
     # --- Save CSV ---
     if out_dir is not None:

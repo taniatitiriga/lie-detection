@@ -59,7 +59,7 @@ Requires: ffmpeg, praat-parselmouth, webrtcvad.
 
 #### Linguistic (unigram TF + Empath categories)
 
-Builds corpus-wide vocabulary (tokens with frequency ≥ 10), computes normalized unigram frequencies per clip, and appends 15 Empath/LIWC-proxy category scores:
+Builds corpus-wide vocabulary (tokens with frequency ≥ 10)uv run python src/extract_acoustic.py, computes normalized unigram frequencies per clip, and appends 15 Empath/LIWC-proxy category scores:
 
 ```
 uv run python src/extract_linguistic.py
@@ -132,7 +132,8 @@ uv run python src/main.py --sanity
 | ---------- | -------------------------------------------------------------------------------------------- |
 | RF         | 100 trees, min_samples_leaf=3                                                                |
 | SVM        | RBF kernel, 4-fold grid search over C∈{0.01–100}, γ∈{0.001–scale}, 3×3 mean-filter smoothing |
-| NN (MLP)   | (64, 32) hidden units, ReLU, Adam, α=1e-3, early stopping (val_frac=0.15, max_iter=1000)    |
+| NN (MLP)   | (64, 32) hidden units, ReLU, Adam, α=1e-3, early stopping (val_frac=0.15, max_iter=1000)     |
+
 
 Accuracy is reported as **macro-averaged LOSO-CV** — per-subject fold accuracy averaged
 across subjects — so every subject contributes equally regardless of clip count.
