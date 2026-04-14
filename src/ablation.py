@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from itertools import combinations
 from pathlib import Path
 import numpy as np
 from typing import Dict
@@ -17,6 +18,7 @@ from evaluation import run_loocv, run_late_fusion_loocv
 
 def run_ablation(
     fac_path: str,
+    vis_path: str,
     acou_path: str,
     ling_path: str,
     n_runs: int = 3,
@@ -24,30 +26,28 @@ def run_ablation(
     subject_level: bool = False,
 ) -> list[dict]:
     """
-    Run the full ablation table (single-modality, early fusion, late fusion)
-    and return a list of result dicts.
-
-    When subject_level=True an extra block of subject-level majority-vote rows
-    is appended to the returned list (and saved to the CSV under eval_level='subject').
+    Run the full ablation table (single-modality, pairwise fusion, all-modality
+    fusion) across 4 modalities and return a list of result dicts.
     """
-    # Load each modality via load_features so clip_id alignment is enforced.
-    # Use the facial CSV's ordering as the canonical clip order, then reindex
-    # acoustic and linguistic to match it.
+    # Load each modality; use the facial CSV's ordering as canonical clip order.
     X_fac, y, subject_ids, clip_ids = load_features([fac_path])
 
-    X_acou, _, _, acou_clip_ids = load_features([acou_path])
-    acou_idx = {cid: i for i, cid in enumerate(acou_clip_ids)}
-    X_acou = X_acou[[acou_idx[cid] for cid in clip_ids]]
+    def _reindex(path: str) -> np.ndarray:
+        X, _, _, cids = load_features([path])
+        idx = {cid: i for i, cid in enumerate(cids)}
+        return X[[idx[cid] for cid in clip_ids]]
 
-    X_ling, _, _, ling_clip_ids = load_features([ling_path])
-    ling_idx = {cid: i for i, cid in enumerate(ling_clip_ids)}
-    X_ling = X_ling[[ling_idx[cid] for cid in clip_ids]]
+    X_vis = _reindex(vis_path)
+    X_acou = _reindex(acou_path)
+    X_ling = _reindex(ling_path)
 
-    modality_X = {
+    modality_X: dict[str, np.ndarray] = {
         "Facial": X_fac,
+        "Visual": X_vis,
         "Acoustic": X_acou,
         "Linguistic": X_ling,
     }
+    mod_names = list(modality_X.keys())
 
     results: list[dict] = []
 
@@ -68,48 +68,45 @@ def run_ablation(
 
     # --- 1. Single-modality (RF, SVM, NN) ---
     print("\n===== Single-modality experiments =====")
-    for mod_name, X_mod in modality_X.items():
+    for mod_name in mod_names:
         for factory in [rf_factory, svm_factory, nn_factory]:
             print(f"\n--- {mod_name} / {factory.label} ---")
             acc, std, _, auc, s_acc, s_std = run_loocv(
-                X_mod, y, subject_ids, clip_ids, factory,
+                modality_X[mod_name], y, subject_ids, clip_ids, factory,
                 scaler=True, n_runs=n_runs, subject_level=subject_level,
             )
             _record(mod_name, "none", factory.label, acc, std, auc, eval_level="clip")
 
-    # --- 2. Two-modality early fusion (NN only per spec, but also others where noted) ---
-    two_mod_combos = [
-        ("Facial+Acoustic", X_fac, X_acou),
-        ("Facial+Linguistic", X_fac, X_ling),
-        ("Acoustic+Linguistic", X_acou, X_ling),
-    ]
-    print("\n===== Two-modality early fusion (NN) =====")
-    for combo_name, Xa, Xb in two_mod_combos:
-        X_early = np.hstack([Xa, Xb])
-        print(f"\n--- {combo_name} / early / NN ---")
-        acc, std, _, auc, s_acc, s_std = run_loocv(
-            X_early, y, subject_ids, clip_ids, nn_factory,
-            scaler=True, n_runs=n_runs, subject_level=subject_level,
-        )
-        _record(combo_name, "early", "NN", acc, std, auc, eval_level="clip")
+    # --- 2. Two-modality early fusion (SVM + NN) ---
+    print("\n===== Two-modality early fusion (SVM, NN) =====")
+    for a, b in combinations(mod_names, 2):
+        combo_name = f"{a}+{b}"
+        X_early = np.hstack([modality_X[a], modality_X[b]])
+        for factory in [svm_factory, nn_factory]:
+            print(f"\n--- {combo_name} / early / {factory.label} ---")
+            acc, std, _, auc, s_acc, s_std = run_loocv(
+                X_early, y, subject_ids, clip_ids, factory,
+                scaler=True, n_runs=n_runs, subject_level=subject_level,
+            )
+            _record(combo_name, "early", factory.label, acc, std, auc, eval_level="clip")
+            if subject_level:
+                _record(combo_name, "early", factory.label, s_acc, s_std, float("nan"), eval_level="subject")
 
-    # --- 3. Two-modality late fusion (NN only) ---
-    print("\n===== Two-modality late fusion (NN) =====")
-    late_two_combos = [
-        ("Facial+Acoustic", [X_fac, X_acou]),
-        ("Facial+Linguistic", [X_fac, X_ling]),
-        ("Acoustic+Linguistic", [X_acou, X_ling]),
-    ]
-    for combo_name, x_list in late_two_combos:
-        print(f"\n--- {combo_name} / late / NN ---")
-        acc, std, auc, w = run_late_fusion_loocv(
-            x_list, y, subject_ids, clip_ids, nn_factory, n_runs=n_runs,
-        )
-        _record(combo_name, "late", "NN", acc, std, auc, eval_level="clip", best_w=w)
+    # --- 3. Two-modality late fusion (SVM + NN) ---
+    print("\n===== Two-modality late fusion (SVM, NN) =====")
+    for a, b in combinations(mod_names, 2):
+        combo_name = f"{a}+{b}"
+        x_list = [modality_X[a], modality_X[b]]
+        for factory in [svm_factory, nn_factory]:
+            print(f"\n--- {combo_name} / late / {factory.label} ---")
+            acc, std, auc, w = run_late_fusion_loocv(
+                x_list, y, subject_ids, clip_ids, factory, n_runs=n_runs,
+            )
+            _record(combo_name, "late", factory.label, acc, std, auc, eval_level="clip", best_w=w)
 
-    # --- 4. All three — early fusion (RF, SVM, NN) ---
-    print("\n===== All three — early fusion =====")
-    X_all_early = np.hstack([X_fac, X_acou, X_ling])
+    # --- 4. All four — early fusion (RF, SVM, NN) ---
+    print("\n===== All four — early fusion =====")
+    X_all_early = np.hstack([modality_X[m] for m in mod_names])
     for factory in [rf_factory, svm_factory, nn_factory]:
         print(f"\n--- All / early / {factory.label} ---")
         acc, std, _, auc, s_acc, s_std = run_loocv(
@@ -117,18 +114,21 @@ def run_ablation(
             scaler=True, n_runs=n_runs, subject_level=subject_level,
         )
         _record("All", "early", factory.label, acc, std, auc, eval_level="clip")
+        if subject_level:
+            _record("All", "early", factory.label, s_acc, s_std, float("nan"), eval_level="subject")
 
-    # --- 5. All three — late fusion (RF, NN) ---
-    print("\n===== All three — late fusion =====")
-    for factory in [rf_factory, nn_factory]:
+    # --- 5. All four — late fusion (RF, SVM, NN) ---
+    print("\n===== All four — late fusion =====")
+    x_all_list = [modality_X[m] for m in mod_names]
+    for factory in [rf_factory, svm_factory, nn_factory]:
         print(f"\n--- All / late / {factory.label} ---")
         acc, std, auc, w = run_late_fusion_loocv(
-            [X_fac, X_acou, X_ling], y, subject_ids, clip_ids,
+            x_all_list, y, subject_ids, clip_ids,
             factory, n_runs=n_runs,
         )
         _record("All", "late", factory.label, acc, std, auc, eval_level="clip", best_w=w)
 
-    # --- Change 3: Subject-level majority-vote rows ---
+    # --- Subject-level majority-vote rows ---
     if subject_level:
         print("\n===== Subject-level majority-vote accuracy =====")
         subject_ids_arr = np.array(subject_ids)
@@ -137,7 +137,6 @@ def run_ablation(
         def _subj_level_acc_for(
             X_m: np.ndarray, factory, n_runs: int
         ) -> tuple[float, float]:
-            """Return (mean_subj_acc, std_subj_acc) across runs."""
             unique_subjects = sorted(set(subject_ids))
             run_accs: list[float] = []
             for run in range(n_runs):
@@ -169,19 +168,14 @@ def run_ablation(
                 run_accs.append(correct / max(1, len(subj_true)))
             return float(np.mean(run_accs)), float(np.std(run_accs))
 
-        for mod_name, X_mod in modality_X.items():
+        for mod_name in mod_names:
             for factory in [rf_factory, svm_factory, nn_factory]:
-                s_acc, s_std = _subj_level_acc_for(X_mod, factory, n_runs)
+                s_acc, s_std = _subj_level_acc_for(modality_X[mod_name], factory, n_runs)
                 print(f"[{factory.label}] {mod_name} Subj-acc={s_acc:.4f} ± {s_std:.4f}")
                 _record(mod_name, "none", factory.label,
                         s_acc, s_std, float("nan"), eval_level="subject")
 
-        # All-three early fusion
-        for factory in [rf_factory, svm_factory, nn_factory]:
-            s_acc, s_std = _subj_level_acc_for(X_all_early, factory, n_runs)
-            print(f"[{factory.label}] All/early Subj-acc={s_acc:.4f} ± {s_std:.4f}")
-            _record("All", "early", factory.label,
-                    s_acc, s_std, float("nan"), eval_level="subject")
+        # All/early and two-modality early subject rows are recorded inline above
 
     # --- Save CSV ---
     if out_dir is not None:

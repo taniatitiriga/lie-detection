@@ -11,12 +11,15 @@ try:
     from sklearn.dummy import DummyClassifier
     from sklearn.calibration import CalibratedClassifierCV
     from sklearn.metrics import roc_auc_score
+    from sklearn.feature_selection import SelectKBest, mutual_info_classif
 except ModuleNotFoundError:
     RandomForestClassifier = None  # type: ignore[assignment]
     StandardScaler = None  # type: ignore[assignment]
     DummyClassifier = None  # type: ignore[assignment]
     CalibratedClassifierCV = None  # type: ignore[assignment]
     roc_auc_score = None  # type: ignore[assignment]
+    SelectKBest = None  # type: ignore[assignment]
+    mutual_info_classif = None  # type: ignore[assignment]
 
 from data_loader import load_features
 from models import rf_factory, nn_factory
@@ -32,6 +35,7 @@ def run_loocv(
     n_runs: int = 3,
     silent: bool = False,
     subject_level: bool = False,
+    feature_select_k: int | None = None,
 ) -> tuple[float, float, list, float]:
     """
     Subject-aware LOSO-CV with macro-averaged fold accuracy.
@@ -39,6 +43,9 @@ def run_loocv(
     Accuracy is computed per fold (one fold = one held-out subject) and then
     averaged across folds — this is the macro-averaged (unweighted) estimate
     and avoids bias toward subjects with many clips.
+
+    When feature_select_k is set, SelectKBest(mutual_info_classif, k=k) is
+    fitted on training data each fold and applied to both train and test.
 
     When subject_level=True, also returns subject-level accuracy computed by
     averaging each subject's predicted class probabilities across their clips
@@ -76,7 +83,11 @@ def run_loocv(
                 X_train = sc.transform(X_train)
                 X_test = sc.transform(X_test)
 
-
+            if feature_select_k is not None and SelectKBest is not None:
+                k = min(feature_select_k, X_train.shape[1])
+                selector = SelectKBest(mutual_info_classif, k=k)
+                X_train = selector.fit_transform(X_train, y_train)
+                X_test = selector.transform(X_test)
 
             clf = clf_factory(run_seed=run)
             clf.fit(X_train, y_train)
@@ -170,6 +181,7 @@ def run_late_fusion_loocv(
     clip_ids: list,
     clf_factory,
     n_runs: int = 3,
+    feature_select_k: int | None = None,
 ) -> tuple[float, float, float, float]:
     """
     Late fusion: train separate classifiers per modality inside each LOOCV
@@ -211,20 +223,36 @@ def run_late_fusion_loocv(
                 X_train_m = sc.transform(X_train_m)
                 X_test_m = sc.transform(X_test_m)
 
+                if feature_select_k is not None and SelectKBest is not None:
+                    k = min(feature_select_k, X_train_m.shape[1])
+                    selector = SelectKBest(mutual_info_classif, k=k)
+                    X_train_m = selector.fit_transform(X_train_m, y_train)
+                    X_test_m = selector.transform(X_test_m)
+
                 clf = clf_factory(run_seed=run)
-
-
 
                 # Wrap SVM and MLP with probability calibration (late-fusion only).
                 # RF produces well-calibrated probabilities via voting; skip it.
                 # cv=3 keeps the inner fold count manageable on ~89 training samples.
+                # Falls back to raw clf if calibration wrapper fails (e.g. non-sklearn estimator).
                 _label = getattr(clf_factory, "label", "")
                 if CalibratedClassifierCV is not None and _label == "SVM":
-                    clf = CalibratedClassifierCV(clf, cv=3, method="sigmoid")
+                    try:
+                        cal = CalibratedClassifierCV(clf, cv=3, method="sigmoid")
+                        cal.fit(X_train_m, y_train)
+                        clf = cal
+                    except (TypeError, ValueError):
+                        clf.fit(X_train_m, y_train)
                 elif CalibratedClassifierCV is not None and _label == "NN":
-                    clf = CalibratedClassifierCV(clf, cv=3, method="isotonic")
+                    try:
+                        cal = CalibratedClassifierCV(clf, cv=3, method="isotonic")
+                        cal.fit(X_train_m, y_train)
+                        clf = cal
+                    except (TypeError, ValueError):
+                        clf.fit(X_train_m, y_train)
+                else:
+                    clf.fit(X_train_m, y_train)
 
-                clf.fit(X_train_m, y_train)
                 probs = clf.predict_proba(X_test_m)[:, 1]
                 for cid, pr in zip(ids, probs):
                     mod_probs[m_idx][cid] = float(pr)

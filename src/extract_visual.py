@@ -9,109 +9,81 @@ from typing import Dict, List, Tuple
 
 # ── column definitions ────────────────────────────────────────────────────────
 
-# 18 binary AU columns (presence/absence)
 AU_C_COLUMNS: List[str] = [
-    "AU01_c",
-    "AU02_c",
-    "AU04_c",
-    "AU05_c",
-    "AU06_c",
-    "AU07_c",
-    "AU09_c",
-    "AU10_c",
-    "AU12_c",
-    "AU14_c",
-    "AU15_c",
-    "AU17_c",
-    "AU20_c",
-    "AU23_c",
-    "AU25_c",
-    "AU26_c",
-    "AU28_c",
-    "AU45_c",
+    "AU01_c", "AU02_c", "AU04_c", "AU05_c", "AU06_c", "AU07_c",
+    "AU09_c", "AU10_c", "AU12_c", "AU14_c", "AU15_c", "AU17_c",
+    "AU20_c", "AU23_c", "AU25_c", "AU26_c", "AU28_c", "AU45_c",
 ]
 
-# 17 AU intensity (regression) columns – AU28 has no _r counterpart in OpenFace
 AU_R_COLUMNS: List[str] = [
-    "AU01_r",
-    "AU02_r",
-    "AU04_r",
-    "AU05_r",
-    "AU06_r",
-    "AU07_r",
-    "AU09_r",
-    "AU10_r",
-    "AU12_r",
-    "AU14_r",
-    "AU15_r",
-    "AU17_r",
-    "AU20_r",
-    "AU23_r",
-    "AU25_r",
-    "AU26_r",
-    "AU45_r",
+    "AU01_r", "AU02_r", "AU04_r", "AU05_r", "AU06_r", "AU07_r",
+    "AU09_r", "AU10_r", "AU12_r", "AU14_r", "AU15_r", "AU17_r",
+    "AU20_r", "AU23_r", "AU25_r", "AU26_r", "AU45_r",
 ]
 
 GAZE_COLUMNS: List[str] = ["gaze_angle_x", "gaze_angle_y"]
 
 POSE_COLUMNS: List[str] = ["pose_Rx", "pose_Ry", "pose_Rz"]
 
+ALL_SIGNAL_COLUMNS: List[str] = AU_C_COLUMNS + AU_R_COLUMNS + GAZE_COLUMNS + POSE_COLUMNS
 
-# ── 6-stat temporal descriptor (matches experiment_RF.py) ─────────────────────
+# Threshold: columns with >90% zero frames across all clips are pruned.
+DEAD_COL_ZERO_FRAC: float = 0.90
 
-# Stat suffixes in fixed order — every signal column gets all 6.
-STAT_SUFFIXES: List[str] = ["mean", "std", "med", "iqr", "mad", "madiff"]
+N_WINDOWS: int = 3
+WINDOW_STAT_SUFFIXES: List[str] = ["mean", "std", "madiff"]
+DELTA_STAT_SUFFIXES: List[str] = ["dmean", "dstd"]
 
 
-def _six_stats(values: List[float]) -> Tuple[float, ...]:
-    """
-    Compute 6 descriptors from a time-series of frame-level values:
-       mean, std, median, IQR, MAD, mean-abs-frame-diff
+# ── stat helpers ──────────────────────────────────────────────────────────────
 
-    Returns a tuple of 6 floats (all 0.0 if *values* is empty).
-    """
+def _mean(values: List[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def _std(values: List[float]) -> float:
+    n = len(values)
+    if n < 2:
+        return 0.0
+    mu = sum(values) / n
+    return math.sqrt(sum((x - mu) ** 2 for x in values) / n)
+
+
+def _madiff(values: List[float]) -> float:
+    """Mean absolute frame-to-frame difference."""
+    n = len(values)
+    if n < 2:
+        return 0.0
+    return sum(abs(values[i] - values[i - 1]) for i in range(1, n)) / (n - 1)
+
+
+def _window_stats(values: List[float]) -> Tuple[float, float, float]:
+    """Return (mean, std, madiff) for one window."""
+    return (_mean(values), _std(values), _madiff(values))
+
+
+def _delta_stats(values: List[float]) -> Tuple[float, float]:
+    """Return (mean, std) of frame-to-frame differences for one window."""
+    if len(values) < 2:
+        return (0.0, 0.0)
+    deltas = [values[i] - values[i - 1] for i in range(1, len(values))]
+    return (_mean(deltas), _std(deltas))
+
+
+def _split_into_windows(values: List[float], n_windows: int = N_WINDOWS) -> List[List[float]]:
+    """Split a frame-level list into n roughly-equal temporal windows."""
     n = len(values)
     if n == 0:
-        return (0.0,) * 6
-
-    arr = sorted(values)  # needed for percentiles / median
-
-    mu = sum(values) / n
-    if n == 1:
-        return (mu, 0.0, mu, 0.0, 0.0, 0.0)
-
-    variance = sum((x - mu) ** 2 for x in values) / n
-    std = math.sqrt(variance)
-
-    # median
-    mid = n // 2
-    med = (arr[mid] + arr[mid - 1]) / 2.0 if n % 2 == 0 else arr[mid]
-
-    # IQR  (Q75 – Q25, linear interpolation)
-    def _pct(sorted_vals: List[float], p: float) -> float:
-        k = (len(sorted_vals) - 1) * p
-        lo = int(math.floor(k))
-        hi = min(lo + 1, len(sorted_vals) - 1)
-        frac = k - lo
-        return sorted_vals[lo] * (1 - frac) + sorted_vals[hi] * frac
-
-    q25 = _pct(arr, 0.25)
-    q75 = _pct(arr, 0.75)
-    iqr = q75 - q25
-
-    # MAD (median absolute deviation)
-    abs_devs = sorted(abs(v - med) for v in values)
-    mad_mid = len(abs_devs) // 2
-    mad = (
-        (abs_devs[mad_mid] + abs_devs[mad_mid - 1]) / 2.0
-        if len(abs_devs) % 2 == 0
-        else abs_devs[mad_mid]
-    )
-
-    # Mean absolute frame-to-frame difference
-    madiff = sum(abs(values[i] - values[i - 1]) for i in range(1, n)) / (n - 1)
-
-    return (mu, std, med, iqr, mad, madiff)
+        return [[] for _ in range(n_windows)]
+    base_size = n // n_windows
+    remainder = n % n_windows
+    windows: List[List[float]] = []
+    start = 0
+    for w in range(n_windows):
+        end = start + base_size + (1 if w < remainder else 0)
+        windows.append(values[start:end])
+        start = end
+    return windows
 
 
 # ── OpenFace runner (unchanged) ───────────────────────────────────────────────
@@ -177,80 +149,127 @@ def _read_labels(
     return clip_ids, subject_id_by_clip, is_deceptive_by_clip
 
 
-# ── per-clip feature extractor ────────────────────────────────────────────────
+# ── dead-column detection (pre-scan) ─────────────────────────────────────────
 
-def _clip_features_from_csv(
+def _find_dead_columns(
+    clip_csv_paths: List[Path],
+    confidence_threshold: float,
+    zero_frac_threshold: float = DEAD_COL_ZERO_FRAC,
+) -> set[str]:
+    """
+    Pre-scan all clip CSVs and return columns where >zero_frac_threshold of
+    all high-confidence frames are zero.  Gaze and pose columns are never pruned.
+    """
+    prunable = set(AU_C_COLUMNS + AU_R_COLUMNS)
+    total_frames: Dict[str, int] = {col: 0 for col in prunable}
+    zero_frames: Dict[str, int] = {col: 0 for col in prunable}
+
+    for path in clip_csv_paths:
+        if not path.exists():
+            continue
+        with path.open("r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames:
+                continue
+            available = set(reader.fieldnames)
+            cols_here = [c for c in prunable if c in available]
+
+            for row in reader:
+                if float(row.get("confidence", "0")) < confidence_threshold:
+                    continue
+                for col in cols_here:
+                    total_frames[col] += 1
+                    if float(row[col]) == 0.0:
+                        zero_frames[col] += 1
+
+    dead: set[str] = set()
+    for col in prunable:
+        if total_frames[col] == 0:
+            dead.add(col)
+        elif zero_frames[col] / total_frames[col] > zero_frac_threshold:
+            dead.add(col)
+
+    return dead
+
+
+# ── per-clip feature extractor (windowed + deltas) ───────────────────────────
+
+def _read_clip_frames(
     clip_csv_path: Path,
     confidence_threshold: float,
-) -> Tuple[Dict[str, float], bool]:
-    """
-    Aggregate frame-level OpenFace features into a single per-clip feature dict.
-
-    Returns
-    -------
-    features : dict  {column_name -> value}
-    has_high_conf_frames : bool
-    """
-    # accumulators: list of per-frame values for each column of interest
-    all_cols = AU_C_COLUMNS + AU_R_COLUMNS + GAZE_COLUMNS + POSE_COLUMNS
-
-    acc: Dict[str, List[float]] = {col: [] for col in all_cols}
+    live_columns: List[str],
+    present_au_r: List[str],
+) -> Dict[str, List[float]]:
+    """Read one clip CSV and return per-column frame-level lists."""
+    acc: Dict[str, List[float]] = {col: [] for col in live_columns}
 
     with clip_csv_path.open("r", newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         if not reader.fieldnames:
             raise ValueError(f"Empty OpenFace CSV: {clip_csv_path}")
 
-        available = set(reader.fieldnames)
-
-        # Validate required columns
-        all_required = AU_C_COLUMNS + GAZE_COLUMNS + POSE_COLUMNS
-        missing = [c for c in all_required if c not in available]
-        if missing:
-            raise KeyError(f"Missing columns in {clip_csv_path.name}: {missing}")
-
-        if "confidence" not in available:
-            raise KeyError(f"Missing `confidence` column in {clip_csv_path.name}")
-
-        # AU_R columns may legitimately be absent for some AU numbers
-        present_au_r = [c for c in AU_R_COLUMNS if c in available]
-        absent_au_r = [c for c in AU_R_COLUMNS if c not in available]
-        if absent_au_r:
-            print(f"  INFO: {clip_csv_path.name} is missing AU_r columns: {absent_au_r}")
-
         for row in reader:
-            confidence = float(row["confidence"])
+            confidence = float(row.get("confidence", "0"))
             if confidence < confidence_threshold:
                 continue
 
-            for col in all_required:
-                acc[col].append(float(row[col]))
-            for col in present_au_r:
-                acc[col].append(float(row[col]))
+            for col in live_columns:
+                if col in present_au_r or col not in AU_R_COLUMNS:
+                    acc[col].append(float(row.get(col, "0")))
+                else:
+                    acc[col].append(0.0)
 
+    return acc
+
+
+def _clip_features_windowed(
+    acc: Dict[str, List[float]],
+    live_columns: List[str],
+    live_au_r: List[str],
+) -> Tuple[Dict[str, float], bool]:
+    """
+    Compute windowed statistics and delta features from frame-level data.
+
+    For each live column: 3 windows x 3 stats (mean, std, madiff).
+    For each live AU_r column: 3 windows x 2 delta stats (dmean, dstd).
+    """
     has_frames = any(len(v) > 0 for v in acc.values())
-
     features: Dict[str, float] = {}
 
-    # All signal groups get the same 6 temporal descriptors.
-    for col in AU_C_COLUMNS + AU_R_COLUMNS + GAZE_COLUMNS + POSE_COLUMNS:
-        stats = _six_stats(acc[col])
-        for suffix, val in zip(STAT_SUFFIXES, stats):
-            features[f"{col}_{suffix}"] = val
+    for col in live_columns:
+        windows = _split_into_windows(acc[col])
+        for w_idx, window in enumerate(windows):
+            stats = _window_stats(window)
+            for suffix, val in zip(WINDOW_STAT_SUFFIXES, stats):
+                features[f"{col}_w{w_idx}_{suffix}"] = val
+
+    for col in live_au_r:
+        windows = _split_into_windows(acc[col])
+        for w_idx, window in enumerate(windows):
+            dm, ds = _delta_stats(window)
+            features[f"{col}_w{w_idx}_dmean"] = dm
+            features[f"{col}_w{w_idx}_dstd"] = ds
 
     return features, has_frames
 
 
-# ── main builder ──────────────────────────────────────────────────────────────
+# ── header builder ────────────────────────────────────────────────────────────
 
-def _build_header() -> List[str]:
-    """Construct the full ordered header list (excluding clip_id / subject_id / is_deceptive)."""
+def _build_header(live_columns: List[str], live_au_r: List[str]) -> List[str]:
+    """Construct the full ordered header (excluding meta columns)."""
     cols: List[str] = []
-    for col in AU_C_COLUMNS + AU_R_COLUMNS + GAZE_COLUMNS + POSE_COLUMNS:
-        for suffix in STAT_SUFFIXES:
-            cols.append(f"{col}_{suffix}")
+    for col in live_columns:
+        for w_idx in range(N_WINDOWS):
+            for suffix in WINDOW_STAT_SUFFIXES:
+                cols.append(f"{col}_w{w_idx}_{suffix}")
+    for col in live_au_r:
+        for w_idx in range(N_WINDOWS):
+            for suffix in DELTA_STAT_SUFFIXES:
+                cols.append(f"{col}_w{w_idx}_{suffix}")
     return cols
 
+
+# ── main builder ──────────────────────────────────────────────────────────────
 
 def build_visual_features_csv(
     labels_csv_path: Path = Path("data/labels.csv"),
@@ -261,19 +280,44 @@ def build_visual_features_csv(
     clip_ids, subject_id_by_clip, is_deceptive_by_clip = _read_labels(labels_csv_path)
     output_csv_path.parent.mkdir(parents=True, exist_ok=True)
 
-    feature_cols = _build_header()
+    # Pre-scan: identify dead columns across dataset.
+    clip_csv_paths = [
+        extracted_au_dir / f"{Path(cid).stem}.csv" for cid in clip_ids
+    ]
+    dead_cols = _find_dead_columns(clip_csv_paths, confidence_threshold)
+    if dead_cols:
+        print(f"Pruned {len(dead_cols)} dead columns: {sorted(dead_cols)}")
+
+    live_columns = [c for c in ALL_SIGNAL_COLUMNS if c not in dead_cols]
+    live_au_r = [c for c in AU_R_COLUMNS if c not in dead_cols]
+
+    feature_cols = _build_header(live_columns, live_au_r)
     header = ["clip_id", "subject_id", "is_deceptive"] + feature_cols
+
+    # Determine which AU_r are actually present per CSV (done once with first existing CSV).
+    present_au_r_set: set[str] | None = None
 
     rows: List[List[object]] = []
     total = len(clip_ids)
 
     for i, clip_id in enumerate(clip_ids, start=1):
-        stem = Path(clip_id).stem          # strip .mp4  ->  trial_lie_001
+        stem = Path(clip_id).stem
         clip_csv_path = extracted_au_dir / f"{stem}.csv"
 
-        features, has_high_conf_frames = _clip_features_from_csv(
-            clip_csv_path=clip_csv_path,
-            confidence_threshold=confidence_threshold,
+        if present_au_r_set is None:
+            with clip_csv_path.open("r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                available = set(reader.fieldnames or [])
+                present_au_r_set = {c for c in live_au_r if c in available}
+
+        present_au_r_list = [c for c in live_au_r if c in present_au_r_set]
+
+        acc = _read_clip_frames(
+            clip_csv_path, confidence_threshold, live_columns, present_au_r_list,
+        )
+
+        features, has_high_conf_frames = _clip_features_windowed(
+            acc, live_columns, live_au_r,
         )
 
         if not has_high_conf_frames:
@@ -293,6 +337,9 @@ def build_visual_features_csv(
             print(f"Progress: {i}/{total} clips")
 
     n_features = len(feature_cols)
+    n_windowed = len(live_columns) * N_WINDOWS * len(WINDOW_STAT_SUFFIXES)
+    n_delta = len(live_au_r) * N_WINDOWS * len(DELTA_STAT_SUFFIXES)
+
     with output_csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(header)
@@ -300,7 +347,9 @@ def build_visual_features_csv(
 
     print(
         f"Done — {output_csv_path.as_posix()} written "
-        f"({len(rows)} rows, {n_features} visual features)"
+        f"({len(rows)} rows, {n_features} features: "
+        f"{n_windowed} windowed + {n_delta} delta, "
+        f"{len(dead_cols)} columns pruned)"
     )
 
 
