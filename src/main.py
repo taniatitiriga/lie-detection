@@ -95,14 +95,12 @@ examples:
         if RandomForestClassifier is None:
             raise ModuleNotFoundError("scikit-learn is required for ablation")
         feat_dir = root / "features"
-        vis_path = str((feat_dir / "visual.csv").resolve())
-        # fac_path = str((feat_dir / "facial.csv").resolve())
+        fac_path = str((feat_dir / "facial.csv").resolve())
         acou_path = str((feat_dir / "acoustic.csv").resolve())
         ling_path = str((feat_dir / "linguistic.csv").resolve())
         print(f"Running full ablation (n_runs={args.n_runs}) ...")
         run_ablation(
-            vis_path=vis_path,
-            # fac_path=fac_path,
+            fac_path=fac_path,
             acou_path=acou_path,
             ling_path=ling_path,
             n_runs=args.n_runs,

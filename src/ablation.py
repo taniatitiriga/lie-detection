@@ -16,7 +16,7 @@ from evaluation import run_loocv, run_late_fusion_loocv
 
 
 def run_ablation(
-    vis_path: str,
+    fac_path: str,
     acou_path: str,
     ling_path: str,
     n_runs: int = 3,
@@ -31,9 +31,9 @@ def run_ablation(
     is appended to the returned list (and saved to the CSV under eval_level='subject').
     """
     # Load each modality via load_features so clip_id alignment is enforced.
-    # Use the visual CSV's ordering as the canonical clip order, then reindex
+    # Use the facial CSV's ordering as the canonical clip order, then reindex
     # acoustic and linguistic to match it.
-    X_vis, y, subject_ids, clip_ids = load_features([vis_path])
+    X_fac, y, subject_ids, clip_ids = load_features([fac_path])
 
     X_acou, _, _, acou_clip_ids = load_features([acou_path])
     acou_idx = {cid: i for i, cid in enumerate(acou_clip_ids)}
@@ -44,7 +44,7 @@ def run_ablation(
     X_ling = X_ling[[ling_idx[cid] for cid in clip_ids]]
 
     modality_X = {
-        "Visual": X_vis,
+        "Facial": X_fac,
         "Acoustic": X_acou,
         "Linguistic": X_ling,
     }
@@ -79,8 +79,8 @@ def run_ablation(
 
     # --- 2. Two-modality early fusion (NN only per spec, but also others where noted) ---
     two_mod_combos = [
-        ("Visual+Acoustic", X_vis, X_acou),
-        ("Visual+Linguistic", X_vis, X_ling),
+        ("Facial+Acoustic", X_fac, X_acou),
+        ("Facial+Linguistic", X_fac, X_ling),
         ("Acoustic+Linguistic", X_acou, X_ling),
     ]
     print("\n===== Two-modality early fusion (NN) =====")
@@ -96,8 +96,8 @@ def run_ablation(
     # --- 3. Two-modality late fusion (NN only) ---
     print("\n===== Two-modality late fusion (NN) =====")
     late_two_combos = [
-        ("Visual+Acoustic", [X_vis, X_acou]),
-        ("Visual+Linguistic", [X_vis, X_ling]),
+        ("Facial+Acoustic", [X_fac, X_acou]),
+        ("Facial+Linguistic", [X_fac, X_ling]),
         ("Acoustic+Linguistic", [X_acou, X_ling]),
     ]
     for combo_name, x_list in late_two_combos:
@@ -109,7 +109,7 @@ def run_ablation(
 
     # --- 4. All three — early fusion (RF, SVM, NN) ---
     print("\n===== All three — early fusion =====")
-    X_all_early = np.hstack([X_vis, X_acou, X_ling])
+    X_all_early = np.hstack([X_fac, X_acou, X_ling])
     for factory in [rf_factory, svm_factory, nn_factory]:
         print(f"\n--- All / early / {factory.label} ---")
         acc, std, _, auc, s_acc, s_std = run_loocv(
@@ -123,7 +123,7 @@ def run_ablation(
     for factory in [rf_factory, nn_factory]:
         print(f"\n--- All / late / {factory.label} ---")
         acc, std, auc, w = run_late_fusion_loocv(
-            [X_vis, X_acou, X_ling], y, subject_ids, clip_ids,
+            [X_fac, X_acou, X_ling], y, subject_ids, clip_ids,
             factory, n_runs=n_runs,
         )
         _record("All", "late", factory.label, acc, std, auc, eval_level="clip", best_w=w)
